@@ -2,7 +2,11 @@
 
 from . import _common as C
 
-API = "https://api.weather.gc.ca/collections/aqhi-observations-realtime/items"
+COLLECTION_IDS = [
+    "aqhi-observations-realtime",
+    "aqhi-realtime",
+]
+API_TMPL = "https://api.weather.gc.ca/collections/{cid}/items"
 PARAMS = {
     "f": "json",
     "limit": 5,
@@ -21,7 +25,17 @@ RISK_BANDS = [
 @C.safe_section("air_quality")
 def render(printer):
     C.banner(printer, "Air Quality (AQHI)")
-    data = C.http_get(API, params=PARAMS, timeout=15).json()
+    data = None
+    last_err = None
+    for cid in COLLECTION_IDS:
+        try:
+            data = C.http_get(API_TMPL.format(cid=cid),
+                              params=PARAMS, timeout=15).json()
+            break
+        except Exception as e:
+            last_err = e
+    if data is None:
+        raise last_err if last_err else RuntimeError("No AQHI API responded")
     feats = data.get("features") or []
     if not feats:
         printer.text("No AQHI observations near Ottawa.\n")
@@ -41,9 +55,9 @@ def render(printer):
                 band = label
                 break
 
-    printer.set(bold=True, double_height=True)
+    printer.set(font="b", bold=True, double_height=True)
     printer.text(f"AQHI {aqhi if aqhi is not None else '-'}\n")
-    printer.set(bold=False, double_height=False)
+    printer.set(font="b", bold=False, double_height=False)
     printer.text(f"{band}\n")
     printer.text(f"Station: {station}\n")
     if obs_time:

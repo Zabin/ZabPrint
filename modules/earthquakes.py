@@ -31,9 +31,9 @@ def render(printer):
     except Exception:
         big = []
 
-    printer.set(bold=True)
+    printer.set(font="b", bold=True)
     printer.text("Significant (24h):\n")
-    printer.set(bold=False)
+    printer.set(font="b", bold=False)
     if not big:
         printer.text("  None reported.\n")
     else:
@@ -44,9 +44,9 @@ def render(printer):
             printer.text(C.wrap_lines(f"  M{mag} {place}"))
 
     printer.text("\n")
-    printer.set(bold=True)
+    printer.set(font="b", bold=True)
     printer.text(f"Within {int(NEARBY_RADIUS_KM)} km of Ottawa:\n")
-    printer.set(bold=False)
+    printer.set(font="b", bold=False)
     try:
         feats = C.http_get(NEARBY, timeout=10).json().get("features", []) or []
     except Exception:

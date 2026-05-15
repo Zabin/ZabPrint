@@ -4,7 +4,7 @@ from datetime import datetime
 
 from . import _common as C
 
-API = "https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=5&mode=list"
+API = "https://ll.thespacedevs.com/2.2.0/launch/upcoming/?limit=5"
 
 
 @C.safe_section("launches")
@@ -29,9 +29,9 @@ def render(printer):
         pad = (r.get("pad") or {}).get("name", "")
         loc = ((r.get("pad") or {}).get("location") or {}).get("name", "")
 
-        printer.set(bold=True)
+        printer.set(font="b", bold=True)
         printer.text(f"{i}. {name}\n")
-        printer.set(bold=False)
+        printer.set(font="b", bold=False)
         printer.text(f"   {when}\n")
         if provider:
             printer.text(f"   {provider}\n")

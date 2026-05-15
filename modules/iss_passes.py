@@ -113,9 +113,9 @@ def render(printer):
 
     for start_t, end_t, peak, peak_t in passes:
         dur = (end_t - start_t).total_seconds() / 60.0
-        printer.set(bold=True)
+        printer.set(font="b", bold=True)
         printer.text(f"{start_t.strftime('%a %H:%MZ')}\n")
-        printer.set(bold=False)
+        printer.set(font="b", bold=False)
         printer.text(f"  duration {dur:.1f} min\n")
         printer.text(f"  peak {peak:.0f} deg at {peak_t.strftime('%H:%MZ')}\n\n")
     C.divider(printer)

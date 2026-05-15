@@ -5,7 +5,7 @@ import random
 
 from . import _common as C
 
-API = "https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/events/{m:02d}/{d:02d}"
+API = "https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/{m:02d}/{d:02d}"
 
 
 @C.safe_section("this_day_history")
@@ -26,9 +26,9 @@ def render(printer):
     for e in sample:
         year = e.get("year", "?")
         text = e.get("text", "").strip()
-        printer.set(bold=True)
+        printer.set(font="b", bold=True)
         printer.text(f"{year}: ")
-        printer.set(bold=False)
+        printer.set(font="b", bold=False)
         printer.text(C.wrap_lines(text))
         printer.text("\n")
     C.divider(printer)

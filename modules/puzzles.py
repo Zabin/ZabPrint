@@ -19,7 +19,15 @@ def _font(size, bold=False):
     try:
         return ImageFont.truetype(f"/usr/share/fonts/truetype/dejavu/{name}", size)
     except Exception:
-        return ImageFont.load_default()
+        try:
+            return ImageFont.truetype(
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf"
+                if bold else
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+                size,
+            )
+        except Exception:
+            return ImageFont.load_default()
 
 
 # ---------------------------- Sudoku ----------------------------

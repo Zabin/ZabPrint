@@ -10,30 +10,46 @@ from __future__ import annotations
 
 import functools
 import io
+import re
 import textwrap
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 import requests
 from PIL import Image
 
 PRINT_WIDTH_PX = 576
-PRINT_WIDTH_CHARS = 48
-USER_AGENT = "ZabPrint/1.0 (+raspberrypi thermal daily report)"
+# Font B (9-dot wide) at 576-px head fits ~64 chars per line.
+PRINT_WIDTH_CHARS = 64
+DEFAULT_FONT = "b"
+# A browser-style UA avoids 403s from CDNs that block obvious bot strings.
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+DEFAULT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "*/*",
+    "Accept-Language": "en-CA,en;q=0.9",
+}
 
 MPL_STYLE = {
-    "font.size": 11,
-    "axes.linewidth": 1.5,
-    "axes.titlesize": 13,
+    "font.size": 9,
+    "axes.linewidth": 1.2,
+    "axes.titlesize": 10,
     "axes.titleweight": "bold",
     "axes.spines.top": False,
     "axes.spines.right": False,
-    "lines.linewidth": 2.5,
-    "xtick.major.width": 1.5,
-    "ytick.major.width": 1.5,
-    "xtick.major.size": 5,
-    "ytick.major.size": 5,
+    "lines.linewidth": 2.0,
+    "xtick.major.width": 1.2,
+    "ytick.major.width": 1.2,
+    "xtick.major.size": 4,
+    "ytick.major.size": 4,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
     "figure.facecolor": "white",
     "axes.facecolor": "white",
     "savefig.facecolor": "white",
@@ -42,16 +58,19 @@ MPL_STYLE = {
 
 def banner(printer, title: str) -> None:
     today = datetime.now().strftime("%Y-%m-%d %a")
-    printer.set(align="center", bold=True, double_height=True, double_width=True)
-    printer.text(title.upper()[:24] + "\n")
-    printer.set(align="center", bold=False, double_height=False, double_width=False)
+    printer.set(align="center", font=DEFAULT_FONT, bold=True,
+                double_height=True, double_width=True)
+    printer.text(title.upper()[:32] + "\n")
+    printer.set(align="center", font=DEFAULT_FONT, bold=False,
+                double_height=False, double_width=False)
     printer.text(today + "\n")
-    printer.set(align="left")
+    printer.set(align="left", font=DEFAULT_FONT)
     printer.text("=" * PRINT_WIDTH_CHARS + "\n")
 
 
 def divider(printer) -> None:
-    printer.set(align="left", bold=False, double_height=False, double_width=False)
+    printer.set(align="left", font=DEFAULT_FONT, bold=False,
+                double_height=False, double_width=False)
     printer.text("-" * PRINT_WIDTH_CHARS + "\n")
     printer.text("\n")
 
@@ -75,7 +94,7 @@ def safe_section(name: str):
                 return fn(printer, *args, **kwargs)
             except Exception as e:
                 try:
-                    printer.set(align="left", bold=False,
+                    printer.set(align="left", font=DEFAULT_FONT, bold=False,
                                 double_height=False, double_width=False)
                     printer.text(f"[{name}] FAILED\n")
                     printer.text(f"{type(e).__name__}: {e}\n")
@@ -90,8 +109,8 @@ def safe_section(name: str):
 
 
 def http_get(url, *, timeout=10, headers=None, auth=None, params=None):
-    """GET with stable UA and one retry on connection error."""
-    h = {"User-Agent": USER_AGENT}
+    """GET with stable browser-like UA and one retry on connection error."""
+    h = dict(DEFAULT_HEADERS)
     if headers:
         h.update(headers)
     last_err = None
@@ -124,7 +143,7 @@ def fig_to_576_bitmap(fig) -> Image.Image:
     return img.convert("1", dither=Image.FLOYDSTEINBERG)
 
 
-def text_to_bitmap(lines, font_size=18, padding=8) -> Image.Image:
+def text_to_bitmap(lines, font_size=14, padding=6) -> Image.Image:
     """Render arbitrary text lines as a 576-px 1-bit image. Useful for puzzles."""
     from PIL import ImageDraw, ImageFont
     try:
@@ -171,8 +190,47 @@ def print_image(printer, img: Image.Image) -> None:
 
 
 def print_text_block(printer, text: str) -> None:
-    printer.set(align="left", bold=False, double_height=False, double_width=False)
+    printer.set(align="left", font=DEFAULT_FONT, bold=False,
+                double_height=False, double_width=False)
     printer.text(wrap_lines(text))
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _strip_html(s: str) -> str:
+    return _WS_RE.sub(" ", _TAG_RE.sub(" ", s or "")).strip()
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def parse_feed(xml_bytes: bytes, *, limit: int = 10) -> list[dict]:
+    """Minimal RSS 2.0 / Atom 1.0 parser. Returns [{title, summary, link}]."""
+    root = ET.fromstring(xml_bytes)
+    items = []
+    for elem in root.iter():
+        local = _local(elem.tag)
+        if local in ("item", "entry"):
+            item = {"title": "", "summary": "", "link": ""}
+            for child in elem:
+                lc = _local(child.tag)
+                if lc == "title":
+                    item["title"] = _strip_html(child.text or "")
+                elif lc in ("summary", "description"):
+                    item["summary"] = _strip_html(child.text or "")
+                elif lc == "content":
+                    if not item["summary"]:
+                        item["summary"] = _strip_html(child.text or "")
+                elif lc == "link":
+                    item["link"] = child.get("href") or (child.text or "")
+            if item["title"]:
+                items.append(item)
+            if len(items) >= limit:
+                break
+    return items
 
 
 def standalone_dummy_run(render_fn, name: str) -> None:
@@ -180,7 +238,7 @@ def standalone_dummy_run(render_fn, name: str) -> None:
     import os
     from escpos.printer import Dummy
     os.makedirs("out", exist_ok=True)
-    p = Dummy()
+    p = Dummy(profile="TM-T20II")  # generic 80mm @ 576 px head
     render_fn(p)
     raw = p.output
     with open(f"out/{name}.bin", "wb") as f:

@@ -1,10 +1,7 @@
 """OC Transpo service alerts."""
 
-import feedparser
-
 from . import _common as C
 
-# OC Transpo publishes service updates as an RSS feed
 FEEDS = [
     "https://www.octranspo.com/en/feeds/updates-en/",
     "https://www.octranspo.com/feeds/updates-en/",
@@ -16,33 +13,33 @@ TOP_N = 6
 def render(printer):
     C.banner(printer, "OC Transpo")
     entries = []
+    last_err = None
+    fetched_ok = False
     for url in FEEDS:
         try:
             raw = C.http_get(url, timeout=10).content
-            feed = feedparser.parse(raw)
-            if feed.entries:
-                entries = feed.entries
+            fetched_ok = True
+            entries = C.parse_feed(raw, limit=TOP_N)
+            if entries:
                 break
-        except Exception:
-            continue
+        except Exception as e:
+            last_err = e
+
+    if not fetched_ok and last_err is not None:
+        raise last_err
 
     if not entries:
         printer.text("No OC Transpo alerts.\n")
         C.divider(printer)
         return
 
-    for i, e in enumerate(entries[:TOP_N], 1):
-        title = e.get("title", "(untitled)").strip()
-        printer.set(bold=True)
+    for i, e in enumerate(entries, 1):
+        printer.set(font="b", bold=True)
         printer.text(f"{i}. ")
-        printer.set(bold=False)
-        printer.text(C.wrap_lines(title))
-        summary = e.get("summary", "").strip()
-        if summary:
-            summary = summary.replace("<p>", "").replace("</p>", " ")
-            summary = summary.split("<")[0]
-            if summary:
-                printer.text(C.wrap_lines(summary[:200]))
+        printer.set(font="b", bold=False)
+        printer.text(C.wrap_lines(e["title"]))
+        if e["summary"]:
+            printer.text(C.wrap_lines(e["summary"][:200]))
         printer.text("\n")
     C.divider(printer)
 

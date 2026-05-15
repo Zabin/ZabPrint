@@ -3,7 +3,8 @@
 from . import _common as C
 
 # OGC API Features endpoint for active alerts (free, no key)
-ALERTS_API = "https://api.weather.gc.ca/collections/alerts-realtime/items"
+COLLECTION_IDS = ["alerts-realtime", "alerts"]
+ALERTS_API_TMPL = "https://api.weather.gc.ca/collections/{cid}/items"
 OTTAWA_BBOX = "-76.0,45.2,-75.4,45.7"  # minlon,minlat,maxlon,maxlat
 
 
@@ -15,7 +16,17 @@ def render(printer):
         "f": "json",
         "limit": 25,
     }
-    data = C.http_get(ALERTS_API, params=params, timeout=15).json()
+    data = None
+    last_err = None
+    for cid in COLLECTION_IDS:
+        try:
+            data = C.http_get(ALERTS_API_TMPL.format(cid=cid),
+                              params=params, timeout=15).json()
+            break
+        except Exception as e:
+            last_err = e
+    if data is None:
+        raise last_err if last_err else RuntimeError("No alerts API responded")
     features = data.get("features", []) or []
 
     # Filter to meteorological alerts only (alert_type or status active)
@@ -44,9 +55,9 @@ def render(printer):
         headline = p.get("headline") or p.get("event") or "Alert"
         sev = p.get("severity", "")
         urgency = p.get("urgency", "")
-        printer.set(bold=True)
+        printer.set(font="b", bold=True)
         printer.text(f"* {headline}\n")
-        printer.set(bold=False)
+        printer.set(font="b", bold=False)
         meta = " / ".join(x for x in [sev, urgency] if x)
         if meta:
             printer.text(f"  {meta}\n")

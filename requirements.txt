@@ -1,9 +1,7 @@
 python-escpos>=3.0
 requests
-feedparser
 matplotlib
 Pillow
 astral
 sgp4
-yfinance
 python-dateutil
