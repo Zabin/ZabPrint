@@ -522,6 +522,11 @@ class Assembler:
             _, cond, s_flag = split_cond(mnemonic, base)
         except ValueError:
             return False
+        # Allow a trailing shift operand ("lsl #N", "asr #1", ...) which
+        # otherwise becomes a separate comma-split operand. Merge it back.
+        if operands and operands[-1].split(' ', 1)[0].lower() in ('lsl', 'lsr', 'asr', 'ror'):
+            tail = operands.pop()
+            operands[-1] = f"{operands[-1]}, {tail}"
         if base in ('mov', 'mvn'):
             if len(operands) != 2:
                 return False
