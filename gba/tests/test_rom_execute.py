@@ -178,6 +178,34 @@ def test_rom_responds_to_dpad_up(rom_bytes):
     assert x_q16 == (120 << 16), "x must not change when only Up is held"
 
 
+def test_rom_planets_and_score_initialised(rom_bytes):
+    """After boot the two planets should be alive at their seeded positions
+    and the score should be 0."""
+    cpu = _FakeVCountCpu(regions=[
+        (ROM_BASE,   2 * 1024 * 1024),
+        (IWRAM_BASE, 32 * 1024),
+        (VRAM_BASE,  96 * 1024),
+        (IO_BASE,    1024),
+    ])
+    cpu.load_code(rom_bytes, at=ROM_BASE)
+    cpu.write_u16(IO_BASE + 0x130, 0xFFFF)
+    cpu.regs[15] = ROM_BASE
+    cpu.run_for(120_000)
+
+    # Planet 1: (60, 50), alive.
+    assert cpu.read_u32(IWRAM_BASE + 0x28) == 60
+    assert cpu.read_u32(IWRAM_BASE + 0x2C) == 50
+    assert cpu.read_u32(IWRAM_BASE + 0x30) == 1
+    # Planet 2: (180, 110), alive.
+    assert cpu.read_u32(IWRAM_BASE + 0x34) == 180
+    assert cpu.read_u32(IWRAM_BASE + 0x38) == 110
+    assert cpu.read_u32(IWRAM_BASE + 0x3C) == 1
+    # Score: 0.
+    assert cpu.read_u32(IWRAM_BASE + 0x44) == 0
+    # frame_count > 0 (several frames have ticked).
+    assert cpu.read_u32(IWRAM_BASE + 0x40) > 0
+
+
 def test_rom_a_button_spawns_projectile(rom_bytes):
     """A-button on edge spawns a projectile; the slot should be active and
     its Q16 position should equal the ship position at spawn-time."""
