@@ -42,61 +42,82 @@ def _ror32(value: int, amount: int) -> int:
 
 
 class ArmCpu:
-    def __init__(self, *, memory_size: int = 1 << 18, base_addr: int = 0):
+    """ARMv4 interpreter with one or more flat memory regions.
+
+    Default: a single 256 KiB region at base 0 (backward-compatible with
+    the original single-region API). For GBA-like layouts, pass `regions=`
+    as a list of (base, size) pairs and the interpreter will route every
+    load/store to the matching region.
+    """
+
+    def __init__(self, *, memory_size: int = 1 << 18, base_addr: int = 0,
+                 regions: list[tuple[int, int]] | None = None):
         self.regs = [0] * 16
         self.n = self.z = self.c = self.v = 0
-        self.memory = bytearray(memory_size)
-        self.base_addr = base_addr
         self.cycles = 0
         self.halted = False
 
+        if regions is None:
+            self._regions: list[tuple[int, int, bytearray]] = [
+                (base_addr, memory_size, bytearray(memory_size))
+            ]
+        else:
+            self._regions = [(b, s, bytearray(s)) for (b, s) in regions]
+
+        # Back-compat shims for the original single-region API:
+        self.memory = self._regions[0][2]
+        self.base_addr = self._regions[0][0]
+
     # -- memory helpers --------------------------------------------------
 
-    def _mem_index(self, addr: int) -> int:
-        idx = (addr - self.base_addr) & 0xFFFFFFFF
-        if idx + 4 > len(self.memory):
-            raise MemoryError(f"address 0x{addr:08X} outside simulated memory")
-        return idx
+    def _resolve(self, addr: int) -> tuple[bytearray, int]:
+        a = addr & 0xFFFFFFFF
+        for base, size, mem in self._regions:
+            if base <= a < base + size:
+                return mem, a - base
+        raise MemoryError(f"unmapped address 0x{a:08X}")
 
     def read_u32(self, addr: int) -> int:
-        i = self._mem_index(addr)
-        return self.memory[i] | (self.memory[i + 1] << 8) \
-            | (self.memory[i + 2] << 16) | (self.memory[i + 3] << 24)
+        mem, i = self._resolve(addr)
+        return mem[i] | (mem[i + 1] << 8) | (mem[i + 2] << 16) | (mem[i + 3] << 24)
 
     def write_u32(self, addr: int, value: int) -> None:
-        i = self._mem_index(addr)
+        mem, i = self._resolve(addr)
         value = _u32(value)
-        self.memory[i]     = value & 0xFF
-        self.memory[i + 1] = (value >> 8) & 0xFF
-        self.memory[i + 2] = (value >> 16) & 0xFF
-        self.memory[i + 3] = (value >> 24) & 0xFF
+        mem[i]     = value & 0xFF
+        mem[i + 1] = (value >> 8) & 0xFF
+        mem[i + 2] = (value >> 16) & 0xFF
+        mem[i + 3] = (value >> 24) & 0xFF
 
     def read_u16(self, addr: int) -> int:
-        i = self._mem_index(addr) if False else (addr - self.base_addr) & 0xFFFFFFFF
-        if i + 2 > len(self.memory):
-            raise MemoryError(addr)
-        return self.memory[i] | (self.memory[i + 1] << 8)
+        mem, i = self._resolve(addr)
+        return mem[i] | (mem[i + 1] << 8)
 
     def write_u16(self, addr: int, value: int) -> None:
-        i = (addr - self.base_addr) & 0xFFFFFFFF
-        if i + 2 > len(self.memory):
-            raise MemoryError(addr)
-        self.memory[i]     = value & 0xFF
-        self.memory[i + 1] = (value >> 8) & 0xFF
+        mem, i = self._resolve(addr)
+        mem[i]     = value & 0xFF
+        mem[i + 1] = (value >> 8) & 0xFF
 
     def read_u8(self, addr: int) -> int:
-        i = (addr - self.base_addr) & 0xFFFFFFFF
-        return self.memory[i]
+        mem, i = self._resolve(addr)
+        return mem[i]
 
     def write_u8(self, addr: int, value: int) -> None:
-        i = (addr - self.base_addr) & 0xFFFFFFFF
-        self.memory[i] = value & 0xFF
+        mem, i = self._resolve(addr)
+        mem[i] = value & 0xFF
 
     def load_code(self, blob: bytes, at: int) -> None:
-        i = (at - self.base_addr) & 0xFFFFFFFF
-        if i + len(blob) > len(self.memory):
-            raise MemoryError("blob does not fit")
-        self.memory[i:i + len(blob)] = blob
+        mem, i = self._resolve(at)
+        if i + len(blob) > len(mem):
+            raise MemoryError(f"blob of {len(blob)} bytes at 0x{at:08X} does not fit region")
+        mem[i:i + len(blob)] = blob
+
+    def run_for(self, cycles: int) -> None:
+        """Step the CPU for at most `cycles` instructions, or until halted."""
+        for _ in range(cycles):
+            if self.halted:
+                return
+            self.step()
 
     # -- register helpers -----------------------------------------------
 
