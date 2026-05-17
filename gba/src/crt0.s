@@ -1,35 +1,32 @@
 @ ============================================================================
-@ crt0.s -- ROM entry + game frame loop (Mode 3 bitmap).
+@ crt0.s -- ROM entry + orbital game frame loop (Mode 3 bitmap).
 @
 @ Mechanics:
-@   * D-pad applies thrust; velocity has friction so the ship drifts.
-@   * A button (edge-detected) fires a projectile (one slot, inherits ship
-@     velocity x4 + forward kick).
-@   * Two planets sit in the world. Hit one with a projectile -> score++,
-@     planet dies. When both planets are dead, the game respawns them at
-@     LCG-randomised positions seeded from the frame counter.
-@   * Score is shown as a horizontal bar of bright green pixels in the
-@     top-left.
+@   * A single large primary at the screen centre. Mass parameter MU.
+@   * Player ship + 3 targets all orbit the primary under Newtonian gravity
+@     (Cowell step in physics.s, semi-implicit Euler, dt = 1 frame).
+@   * D-pad applies small impulses to the player's velocity vector, letting
+@     you raise / lower / re-shape your orbit.
+@   * Touch a target (integer pixel distance <= 4) -> score++ and the target
+@     respawns at its initial orbital state (kept in ROM as init_orbits).
 @
-@ State at IWRAM 0x03000000:
-@   +0x00  ship_x_q16        Q16.16 position
-@   +0x04  ship_y_q16
-@   +0x08  ship_vx_q16       Q16.16 velocity
-@   +0x0C  ship_vy_q16
+@ Art:
+@   * Procedural starfield (32 LCG stars, stable seed).
+@   * Big banded planet -- three concentric discs at the centre.
+@   * Targets: 3x3 squares in red/green/cyan.
+@   * Player ship: 3x3 white core + a yellow nose pixel offset in the
+@     direction of travel (8-way lookup from fx_atan2 output).
+@   * Score bar: bright-green horizontal pixels at top-left.
+@
+@ State at IWRAM 0x03000000 (80 bytes / 20 words):
+@   +0x00  player  { x_q16, y_q16, vx_q16, vy_q16 }
 @   +0x10  prev_keys
-@   +0x14  proj_x_q16
-@   +0x18  proj_y_q16
-@   +0x1C  proj_vx_q16
-@   +0x20  proj_vy_q16
-@   +0x24  proj_active
-@   +0x28  p1_x  (integer)
-@   +0x2C  p1_y
-@   +0x30  p1_alive
-@   +0x34  p2_x
-@   +0x38  p2_y
-@   +0x3C  p2_alive
-@   +0x40  frame_count       LCG seed source for respawns
-@   +0x44  score             number of planets killed
+@   +0x14  score
+@   +0x18  frame_count
+@   +0x1C  (pad)
+@   +0x20  target 0 { x_q16, y_q16, vx_q16, vy_q16 }
+@   +0x30  target 1 { ... }
+@   +0x40  target 2 { ... }
 @ ============================================================================
 
         .arm
@@ -41,29 +38,23 @@
         .equ VRAM,        0x06000000
 
         .equ STATE,       0x03000000
-        .equ S_SHIP_X,    0x00
-        .equ S_SHIP_Y,    0x04
-        .equ S_SHIP_VX,   0x08
-        .equ S_SHIP_VY,   0x0C
+        .equ S_PLAYER,    0x00
         .equ S_PREV,      0x10
-        .equ S_PROJ_X,    0x14
-        .equ S_PROJ_Y,    0x18
-        .equ S_PROJ_VX,   0x1C
-        .equ S_PROJ_VY,   0x20
-        .equ S_PROJ_ON,   0x24
-        .equ S_P1_X,      0x28
-        .equ S_P1_Y,      0x2C
-        .equ S_P1_ALIVE,  0x30
-        .equ S_P2_X,      0x34
-        .equ S_P2_Y,      0x38
-        .equ S_P2_ALIVE,  0x3C
-        .equ S_FRAME,     0x40
-        .equ S_SCORE,     0x44
+        .equ S_SCORE,     0x14
+        .equ S_FRAME,     0x18
+        .equ S_T0,        0x20
+        .equ S_T1,        0x30
+        .equ S_T2,        0x40
 
-        .equ THRUST,      0x4000        @ 0.25 in Q16
-        .equ SHIP_X0,     0x00780000    @ 120 << 16
-        .equ SHIP_Y0,     0x00500000    @  80 << 16
-        .equ PROJ_KICK,   0x00040000    @ 4 px/frame forward
+        @ Tuning: planet at screen centre, MU sized for ~4-second orbits at
+        @ radius 40 pixels. These match the defaults in physics.s.
+        .equ PLANET_X,    120
+        .equ PLANET_Y,    80
+        .equ PLANET_X_Q16, 0x00780000
+        .equ PLANET_Y_Q16, 0x00500000
+        .equ MU_Q16,       0x001E0000
+
+        .equ THRUST,      0x2000          @ 0.125 in Q16 -- subtle nudges
 
 _start:
         ldr     sp, =0x03007F00
@@ -71,7 +62,7 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (20 words = 80 bytes covers everything).
+        @ Zero the state block (20 words).
         ldr     r0, =STATE
         mov     r1, #0
         mov     r2, #20
@@ -81,27 +72,20 @@ init_z:
         subs    r2, r2, #1
         bne     init_z
 
-        @ Seed initial values that aren't zero.
-        ldr     r0, =STATE
-        ldr     r1, =SHIP_X0
-        str     r1, [r0, #S_SHIP_X]
-        ldr     r1, =SHIP_Y0
-        str     r1, [r0, #S_SHIP_Y]
-        mov     r1, #60
-        str     r1, [r0, #S_P1_X]
-        mov     r1, #50
-        str     r1, [r0, #S_P1_Y]
-        mov     r1, #1
-        str     r1, [r0, #S_P1_ALIVE]
-        mov     r1, #180
-        str     r1, [r0, #S_P2_X]
-        mov     r1, #110
-        str     r1, [r0, #S_P2_Y]
-        mov     r1, #1
-        str     r1, [r0, #S_P2_ALIVE]
+        @ Copy ROM-bound initial-orbit table into player + 3 targets.
+        @ The table is 16 words (4 bodies * 4 words each); body 0 -> player,
+        @ bodies 1..3 -> targets at S_T0, S_T1, S_T2.
+        ldr     r0, =init_orbits
+        ldr     r1, =STATE
+        @ player (4 words)
+        bl      _copy_orbit_body
+        add     r1, r1, #(S_T0 - S_PLAYER - 16)   @ skip prev/score/frame/pad
+        bl      _copy_orbit_body
+        bl      _copy_orbit_body
+        bl      _copy_orbit_body
 
 frame_loop:
-        @ -------- vsync ------------------------------------------------
+        @ -------- vsync -----------------------------------------------
         ldr     r3, =VCOUNT
 wait_end_vblank:
         ldrh    r2, [r3]
@@ -112,195 +96,89 @@ wait_start_vblank:
         cmp     r2, #160
         blt     wait_start_vblank
 
-        @ -------- frame_count++ (drives respawn LCG) -------------------
+        @ -------- frame_count++ ---------------------------------------
         ldr     r12, =STATE
         ldr     r1, [r12, #S_FRAME]
         add     r1, r1, #1
         str     r1, [r12, #S_FRAME]
 
-        @ -------- input read + edge detect -----------------------------
+        @ -------- input + edge detect ---------------------------------
         ldr     r0, =KEYINPUT
         ldrh    r0, [r0]
         mvn     r0, r0
-
         ldr     r1, [r12, #S_PREV]
         str     r0, [r12, #S_PREV]
-        bic     r1, r0, r1              @ newly pressed
 
-        @ -------- thrust + friction ------------------------------------
-        ldr     r4, [r12, #S_SHIP_VX]
-        ldr     r5, [r12, #S_SHIP_VY]
+        @ -------- D-pad thrust on player ------------------------------
+        ldr     r4, [r12, #(S_PLAYER + 8)]      @ vx
+        ldr     r5, [r12, #(S_PLAYER + 12)]     @ vy
         ldr     r6, =THRUST
-        tst     r0, #0x10
+        tst     r0, #0x10                       @ Right
         addne   r4, r4, r6
-        tst     r0, #0x20
+        tst     r0, #0x20                       @ Left
         subne   r4, r4, r6
-        tst     r0, #0x40
+        tst     r0, #0x40                       @ Up
         subne   r5, r5, r6
-        tst     r0, #0x80
+        tst     r0, #0x80                       @ Down
         addne   r5, r5, r6
-        sub     r4, r4, r4, asr #5
-        sub     r5, r5, r5, asr #5
-        str     r4, [r12, #S_SHIP_VX]
-        str     r5, [r12, #S_SHIP_VY]
+        str     r4, [r12, #(S_PLAYER + 8)]
+        str     r5, [r12, #(S_PLAYER + 12)]
 
-        @ -------- integrate position + clamp ---------------------------
-        ldr     r7, [r12, #S_SHIP_X]
-        ldr     r8, [r12, #S_SHIP_Y]
-        add     r7, r7, r4
-        add     r8, r8, r5
-        mov     r9, #0x00020000
-        cmp     r7, r9
-        movlt   r7, r9
-        mov     r9, #0x00ED0000
-        cmp     r7, r9
-        movgt   r7, r9
-        mov     r9, #0x00020000
-        cmp     r8, r9
-        movlt   r8, r9
-        mov     r9, #0x009D0000
-        cmp     r8, r9
-        movgt   r8, r9
-        str     r7, [r12, #S_SHIP_X]
-        str     r8, [r12, #S_SHIP_Y]
+        @ -------- Cowell step on each body ----------------------------
+        ldr     r0, =STATE
+        bl      cowell_step                     @ player
+        ldr     r0, =STATE
+        add     r0, r0, #S_T0
+        bl      cowell_step
+        ldr     r0, =STATE
+        add     r0, r0, #S_T1
+        bl      cowell_step
+        ldr     r0, =STATE
+        add     r0, r0, #S_T2
+        bl      cowell_step
 
-        @ -------- projectile: spawn or update --------------------------
-        ldr     r9, [r12, #S_PROJ_ON]
-        cmp     r9, #0
-        bne     proj_update
-        tst     r1, #0x01
-        beq     proj_done
-        @ spawn
-        str     r7, [r12, #S_PROJ_X]
-        str     r8, [r12, #S_PROJ_Y]
-        mov     r2, r4, lsl #2
-        ldr     r3, =PROJ_KICK
-        add     r2, r2, r3
-        str     r2, [r12, #S_PROJ_VX]
-        mov     r2, r5, lsl #2
-        str     r2, [r12, #S_PROJ_VY]
-        mov     r2, #1
-        str     r2, [r12, #S_PROJ_ON]
-        b       proj_done
+        @ -------- target collision: each target vs player -------------
+        @ Player integer position
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_PLAYER]
+        ldr     r1, [r12, #(S_PLAYER + 4)]
+        mov     r4, r0, asr #16                 @ player int x
+        mov     r5, r1, asr #16                 @ player int y
 
-proj_update:
-        ldr     r2, [r12, #S_PROJ_X]
-        ldr     r3, [r12, #S_PROJ_Y]
-        ldr     r9, [r12, #S_PROJ_VX]
-        ldr     r10, [r12, #S_PROJ_VY]
-        add     r2, r2, r9
-        add     r3, r3, r10
-        str     r2, [r12, #S_PROJ_X]
-        str     r3, [r12, #S_PROJ_Y]
-        mov     r9, r2, asr #16
-        mov     r10, r3, asr #16
-        cmp     r9, #0
-        blt     proj_off
-        cmp     r9, #240
-        bge     proj_off
-        cmp     r10, #0
-        blt     proj_off
-        cmp     r10, #160
-        bge     proj_off
-
-        @ Projectile is on screen -- test against planets.
-        @ Planet 1
-        ldr     r11, [r12, #S_P1_ALIVE]
-        cmp     r11, #0
-        beq     test_p2
-        ldr     r0, [r12, #S_P1_X]
-        ldr     r1, [r12, #S_P1_Y]
-        sub     r0, r9, r0
-        sub     r1, r10, r1
+        mov     r6, #0                          @ target index 0..2
+target_collide_loop:
+        @ Compute byte offset of this target's state slot.
+        @ S_T0 + i*0x10
+        mov     r7, r6, lsl #4
+        add     r7, r7, #S_T0
+        add     r8, r12, r7                     @ &target[i]
+        ldr     r0, [r8]
+        ldr     r1, [r8, #4]
+        mov     r0, r0, asr #16
+        mov     r1, r1, asr #16
+        sub     r0, r4, r0
+        sub     r1, r5, r1
         mul     r0, r0, r0
         mul     r1, r1, r1
         add     r0, r0, r1
-        cmp     r0, #25
-        bgt     test_p2
-        @ HIT p1
-        mov     r11, #0
-        str     r11, [r12, #S_P1_ALIVE]
-        str     r11, [r12, #S_PROJ_ON]
+        cmp     r0, #16                         @ within 4 pixels?
+        bgt     no_collect
+        @ Collected! Respawn from init_orbits[1 + i] (body 1, 2, 3).
+        ldr     r0, =init_orbits
+        add     r9, r6, #1                      @ body index 1, 2, 3
+        add     r0, r0, r9, lsl #4              @ + 16*body_idx
+        mov     r1, r8                          @ dst = target slot
+        push    {r6, r12, lr}
+        bl      _copy_orbit_body
+        pop     {r6, r12, lr}
+        @ Score++
         ldr     r0, [r12, #S_SCORE]
         add     r0, r0, #1
         str     r0, [r12, #S_SCORE]
-        b       proj_done
-
-test_p2:
-        ldr     r11, [r12, #S_P2_ALIVE]
-        cmp     r11, #0
-        beq     proj_done
-        ldr     r0, [r12, #S_P2_X]
-        ldr     r1, [r12, #S_P2_Y]
-        sub     r0, r9, r0
-        sub     r1, r10, r1
-        mul     r0, r0, r0
-        mul     r1, r1, r1
-        add     r0, r0, r1
-        cmp     r0, #25
-        bgt     proj_done
-        @ HIT p2
-        mov     r11, #0
-        str     r11, [r12, #S_P2_ALIVE]
-        str     r11, [r12, #S_PROJ_ON]
-        ldr     r0, [r12, #S_SCORE]
-        add     r0, r0, #1
-        str     r0, [r12, #S_SCORE]
-        b       proj_done
-
-proj_off:
-        mov     r2, #0
-        str     r2, [r12, #S_PROJ_ON]
-
-proj_done:
-        @ -------- respawn if both planets dead -------------------------
-        ldr     r0, [r12, #S_P1_ALIVE]
-        ldr     r1, [r12, #S_P2_ALIVE]
-        orr     r0, r0, r1
-        cmp     r0, #0
-        bne     respawn_done
-
-        @ LCG step from frame counter -> two new positions.
-        ldr     r6, [r12, #S_FRAME]
-        ldr     r7, =1103515245
-        ldr     r8, =12345
-        mla     r6, r7, r6, r8
-        mov     r0, r6, lsr #8
-        and     r0, r0, #0xFF
-        cmp     r0, #200
-        movgt   r0, #200
-        cmp     r0, #20
-        movlt   r0, #20
-        mov     r1, r6, lsr #20
-        and     r1, r1, #0xFF
-        cmp     r1, #140
-        movgt   r1, #140
-        cmp     r1, #20
-        movlt   r1, #20
-        str     r0, [r12, #S_P1_X]
-        str     r1, [r12, #S_P1_Y]
-        mov     r9, #1
-        str     r9, [r12, #S_P1_ALIVE]
-
-        mla     r6, r7, r6, r8
-        mov     r0, r6, lsr #8
-        and     r0, r0, #0xFF
-        cmp     r0, #200
-        movgt   r0, #200
-        cmp     r0, #20
-        movlt   r0, #20
-        mov     r1, r6, lsr #20
-        and     r1, r1, #0xFF
-        cmp     r1, #140
-        movgt   r1, #140
-        cmp     r1, #20
-        movlt   r1, #20
-        str     r0, [r12, #S_P2_X]
-        str     r1, [r12, #S_P2_Y]
-        mov     r9, #1
-        str     r9, [r12, #S_P2_ALIVE]
-
-respawn_done:
+no_collect:
+        add     r6, r6, #1
+        cmp     r6, #3
+        blt     target_collide_loop
 
         @ -------- clear VRAM ------------------------------------------
         ldr     r0, =VRAM
@@ -339,43 +217,105 @@ star_skip:
         subs    r11, r11, #1
         bne     star_loop
 
-        @ -------- planets ----------------------------------------------
-        ldr     r12, =STATE
-        ldr     r4, [r12, #S_P1_ALIVE]
-        cmp     r4, #0
-        beq     skip_p1_draw
-        ldr     r0, [r12, #S_P1_X]
-        ldr     r1, [r12, #S_P1_Y]
-        ldr     r2, =0x001F
-        bl      draw_disc9
-skip_p1_draw:
-        ldr     r12, =STATE
-        ldr     r4, [r12, #S_P2_ALIVE]
-        cmp     r4, #0
-        beq     skip_p2_draw
-        ldr     r0, [r12, #S_P2_X]
-        ldr     r1, [r12, #S_P2_Y]
-        ldr     r2, =0x7C00
-        bl      draw_disc9
-skip_p2_draw:
+        @ -------- planet: three concentric bands -----------------------
+        @ Outer rim (radius 14), light tan
+        mov     r0, #PLANET_X
+        mov     r1, #PLANET_Y
+        mov     r2, #14
+        ldr     r3, =0x3AFB                     @ pale tan BGR555
+        bl      draw_disc
 
-        @ -------- projectile (if active) -------------------------------
+        @ Mid band (radius 10), warmer
+        mov     r0, #PLANET_X
+        mov     r1, #PLANET_Y
+        mov     r2, #10
+        ldr     r3, =0x126F                     @ rust orange
+        bl      draw_disc
+
+        @ Core (radius 5), deep
+        mov     r0, #PLANET_X
+        mov     r1, #PLANET_Y
+        mov     r2, #5
+        ldr     r3, =0x08AC                     @ dark amber
+        bl      draw_disc
+
+        @ -------- targets (3x3 colored squares) -----------------------
         ldr     r12, =STATE
-        ldr     r3, [r12, #S_PROJ_ON]
-        cmp     r3, #0
-        beq     skip_proj_draw
-        ldr     r0, [r12, #S_PROJ_X]
-        ldr     r1, [r12, #S_PROJ_Y]
+
+        ldr     r0, [r12, #S_T0]
+        ldr     r1, [r12, #(S_T0 + 4)]
         mov     r0, r0, asr #16
         mov     r1, r1, asr #16
-        ldr     r9, =VRAM
-        mov     r3, #240
-        mul     r2, r1, r3
-        add     r2, r2, r0
-        add     r2, r9, r2, lsl #1
-        ldr     r3, =0x03FF
-        strh    r3, [r2]
-skip_proj_draw:
+        ldr     r2, =0x001F                     @ red
+        bl      draw_square3
+
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_T1]
+        ldr     r1, [r12, #(S_T1 + 4)]
+        mov     r0, r0, asr #16
+        mov     r1, r1, asr #16
+        ldr     r2, =0x03E0                     @ green
+        bl      draw_square3
+
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_T2]
+        ldr     r1, [r12, #(S_T2 + 4)]
+        mov     r0, r0, asr #16
+        mov     r1, r1, asr #16
+        ldr     r2, =0x7FE0                     @ cyan-white
+        bl      draw_square3
+
+        @ -------- player ship core + heading nose ---------------------
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_PLAYER]
+        ldr     r1, [r12, #(S_PLAYER + 4)]
+        mov     r0, r0, asr #16                 @ int x
+        mov     r1, r1, asr #16                 @ int y
+        push    {r0, r1}                        @ save for nose
+        ldr     r2, =0x7FFF                     @ white
+        bl      draw_square3
+        pop     {r4, r5}                        @ r4=cx, r5=cy
+
+        @ Heading nose: atan2(vy, vx) -> 8-way bin -> offset table
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER + 12)]     @ vy first (Pythonic y arg)
+        ldr     r1, [r12, #(S_PLAYER + 8)]      @ vx
+        @ If both vx and vy are essentially zero, skip nose (no heading).
+        orrs    r2, r0, r1
+        beq     skip_nose
+        bl      fx_atan2                        @ r0 = brad
+        @ Round to nearest 8-bin: add 0x1000, shift right 13, mask 7
+        ldr     r1, =0x1000
+        add     r0, r0, r1
+        mov     r0, r0, lsr #13
+        and     r0, r0, #7
+        @ dx = nose_dx[idx], dy = nose_dy[idx]
+        ldr     r1, =nose_dx
+        add     r1, r1, r0, lsl #2
+        ldr     r6, [r1]
+        ldr     r1, =nose_dy
+        add     r1, r1, r0, lsl #2
+        ldr     r7, [r1]
+        @ Plot pixel at (cx + dx, cy + dy)
+        add     r2, r4, r6                      @ px
+        add     r3, r5, r7                      @ py
+        @ Clamp into screen (cheap guard).
+        cmp     r2, #0
+        blt     skip_nose
+        cmp     r2, #240
+        bge     skip_nose
+        cmp     r3, #0
+        blt     skip_nose
+        cmp     r3, #160
+        bge     skip_nose
+        mov     r0, #240
+        mul     r0, r3, r0
+        add     r0, r0, r2
+        ldr     r1, =VRAM
+        add     r0, r1, r0, lsl #1
+        ldr     r1, =0x03FF                     @ yellow
+        strh    r1, [r0]
+skip_nose:
 
         @ -------- score bar (green pixels at top-left) -----------------
         ldr     r12, =STATE
@@ -384,8 +324,8 @@ skip_proj_draw:
         beq     skip_score
         cmp     r0, #50
         movgt   r0, #50
-        ldr     r1, =(0x06000000 + 482)  @ VRAM + (2*240 + 1)*2
-        ldr     r2, =0x03E0              @ bright green
+        ldr     r1, =(0x06000000 + 482)         @ VRAM + (2*240 + 1)*2
+        ldr     r2, =0x03E0                     @ bright green
 score_loop:
         strh    r2, [r1]
         add     r1, r1, #2
@@ -393,28 +333,38 @@ score_loop:
         bne     score_loop
 skip_score:
 
-        @ -------- ship -------------------------------------------------
-        ldr     r12, =STATE
-        ldr     r0, [r12, #S_SHIP_X]
-        ldr     r1, [r12, #S_SHIP_Y]
-        mov     r0, r0, asr #16
-        mov     r1, r1, asr #16
-        ldr     r2, =0x7FFF
-        bl      draw_square5
-
         b       frame_loop
 
 @ ----------------------------------------------------------------------------
-draw_square5:
+@ _copy_orbit_body -- copy 16 bytes (1 body's worth) from r0 -> r1, advancing
+@ both pointers so callers can chain calls.
+@ ----------------------------------------------------------------------------
+_copy_orbit_body:
+        ldr     r2, [r0]
+        str     r2, [r1]
+        ldr     r2, [r0, #4]
+        str     r2, [r1, #4]
+        ldr     r2, [r0, #8]
+        str     r2, [r1, #8]
+        ldr     r2, [r0, #12]
+        str     r2, [r1, #12]
+        add     r0, r0, #16
+        add     r1, r1, #16
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ draw_square3(cx, cy, color) -- 3x3 filled.
+@ ----------------------------------------------------------------------------
+draw_square3:
         push    {r4, r5, r6, r7, r8, lr}
-        sub     r4, r1, #2
-        sub     r5, r0, #2
-        mov     r6, #5
+        sub     r4, r1, #1
+        sub     r5, r0, #1
+        mov     r6, #3
         ldr     r7, =VRAM
-sq5_row:
+sq3_row:
         mov     r8, r5
-        mov     r0, #5
-sq5_col:
+        mov     r0, #3
+sq3_col:
         mov     r1, #240
         mul     r3, r4, r1
         add     r3, r3, r8
@@ -422,46 +372,110 @@ sq5_col:
         strh    r2, [r3]
         add     r8, r8, #1
         subs    r0, r0, #1
-        bne     sq5_col
+        bne     sq3_col
         add     r4, r4, #1
         subs    r6, r6, #1
-        bne     sq5_row
+        bne     sq3_row
         pop     {r4, r5, r6, r7, r8, lr}
         bx      lr
 
 @ ----------------------------------------------------------------------------
-draw_disc9:
-        push    {r4, r5, r6, r7, r8, r9, r10, lr}
-        mov     r3, r0
-        mov     r4, r1
-        mov     r5, r2
-        ldr     r6, =VRAM
-        mov     r7, #0
-disc_y:
-        sub     r8, r7, #4
-        mul     r9, r8, r8
-        mov     r10, #0
-disc_x:
-        sub     r0, r10, #4
-        mul     r1, r0, r0
-        add     r1, r1, r9
-        cmp     r1, #16
-        bgt     disc_skip
-        add     r2, r3, r0
-        add     r1, r4, r8
-        mov     r0, #240
-        mul     r0, r1, r0
-        add     r0, r0, r2
-        add     r0, r6, r0, lsl #1
-        strh    r5, [r0]
-disc_skip:
+@ draw_disc(cx, cy, r, color) -- filled disc.
+@   Walks a (2r+1)^2 box, plots pixels where dx*dx + dy*dy <= r*r.
+@   Caller must keep the disc on-screen (no clamping here).
+@ ----------------------------------------------------------------------------
+draw_disc:
+        push    {r4, r5, r6, r7, r8, r9, r10, r11, lr}
+        mov     r4, r0                          @ cx
+        mov     r5, r1                          @ cy
+        mov     r6, r2                          @ r
+        mov     r7, r3                          @ color
+        mul     r8, r6, r6                      @ r*r
+        ldr     r11, =VRAM
+
+        rsb     r9, r6, #0                      @ dy = -r
+disc_y2:
+        rsb     r10, r6, #0                     @ dx = -r
+disc_x2:
+        mul     r0, r9, r9
+        mul     r1, r10, r10
+        add     r1, r1, r0
+        cmp     r1, r8
+        bgt     disc_skip2
+        add     r0, r4, r10                     @ px
+        add     r1, r5, r9                      @ py
+        mov     r2, #240
+        mul     r2, r1, r2
+        add     r2, r2, r0
+        add     r2, r11, r2, lsl #1
+        strh    r7, [r2]
+disc_skip2:
         add     r10, r10, #1
-        cmp     r10, #9
-        blt     disc_x
-        add     r7, r7, #1
-        cmp     r7, #9
-        blt     disc_y
-        pop     {r4, r5, r6, r7, r8, r9, r10, lr}
+        cmp     r10, r6
+        ble     disc_x2
+        add     r9, r9, #1
+        cmp     r9, r6
+        ble     disc_y2
+        pop     {r4, r5, r6, r7, r8, r9, r10, r11, lr}
         bx      lr
+
+@ ----------------------------------------------------------------------------
+@ Initial-orbit table (4 bodies). Each entry is 4 words: x, y, vx, vy in Q16.
+@ Computed from MU=30, planet at (120, 80):
+@
+@   body 0 (player): r=40 above   -> (120, 40) v=( v_circ_40, 0)
+@   body 1 (target): r=50 right   -> (170, 80) v=( 0, +v_circ_50)
+@   body 2 (target): r=30 below   -> (120,110) v=(-v_circ_30, 0)
+@   body 3 (target): r=60 left    -> ( 60, 80) v=( 0, -v_circ_60)
+@
+@   v_circ_40 = sqrt(30/40) * Q16  = 56756
+@   v_circ_50 = sqrt(30/50) * Q16  = 50774
+@   v_circ_30 = sqrt(30/30) * Q16  = 65536
+@   v_circ_60 = sqrt(30/60) * Q16  = 46341
+@ ----------------------------------------------------------------------------
+        .align 2
+init_orbits:
+        @ body 0 -- player at (120, 40), moving right
+        .word 0x00780000        @ x = 120<<16
+        .word 0x00280000        @ y =  40<<16
+        .word 56756             @ vx = v_circ_40
+        .word 0                 @ vy
+
+        @ body 1 -- target at (170, 80), moving down
+        .word 0x00AA0000
+        .word 0x00500000
+        .word 0
+        .word 50774             @ +v_circ_50
+
+        @ body 2 -- target at (120, 110), moving left
+        .word 0x00780000
+        .word 0x006E0000
+        .word -65536            @ -v_circ_30
+        .word 0
+
+        @ body 3 -- target at (60, 80), moving up
+        .word 0x003C0000
+        .word 0x00500000
+        .word 0
+        .word -46341            @ -v_circ_60
+
+@ ----------------------------------------------------------------------------
+@ Heading-nose offset table: 8 directions, 3-px offset from ship centre.
+@ Index by ((brad + 0x1000) >> 13) & 7. Direction 0 is +x (right); CCW in
+@ screen coords means down (since +y is down on the GBA).
+@   0 ->  +X     (right)
+@   1 ->  +X +Y  (right-down)
+@   2 ->  +Y     (down)
+@   3 ->  -X +Y  (left-down)
+@   4 ->  -X     (left)
+@   5 ->  -X -Y  (left-up)
+@   6 ->  -Y     (up)
+@   7 ->  +X -Y  (right-up)
+@ ----------------------------------------------------------------------------
+        .align 2
+nose_dx:
+        .word  3,  2,  0, -2, -3, -2,  0,  2
+nose_dy:
+        .word  0,  2,  3,  2,  0, -2, -3, -2
 
         .ltorg

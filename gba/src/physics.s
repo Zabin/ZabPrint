@@ -13,6 +13,12 @@
         .arm
         .align 2
 
+        @ Default planet + gravitational parameter. Consumers (crt0.s, tests)
+        @ may re-`.equ` these later -- the assembler keeps the last value.
+        .equ PLANET_X_Q16, 0x00780000      @ 120 << 16
+        .equ PLANET_Y_Q16, 0x00500000      @  80 << 16
+        .equ MU_Q16,       0x001E0000      @  30 << 16
+
 @ ----------------------------------------------------------------------------
 @ fx_mul_q16(a, b) -> (a * b) >> 16  (signed)
 @ ----------------------------------------------------------------------------
@@ -142,4 +148,98 @@ fx_atan2:
         moveq   r0, #0
         bxeq    lr
         swi     0x090000
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ cowell_step(state_ptr) -- semi-implicit Euler Newtonian gravity step.
+@
+@   state_ptr -> [ x_q16, y_q16, vx_q16, vy_q16 ]  (16 bytes)
+@
+@ Computes the acceleration from a single fixed primary at
+@ (PLANET_X_Q16, PLANET_Y_Q16) with mass parameter MU_Q16 (linker-supplied
+@ via .equ in the consuming source), then updates:
+@
+@   r_vec  = body - planet            (pointing FROM planet TO body)
+@   r2     = |r_vec|^2
+@   r      = sqrt(r2)
+@   a_mag  = MU / r2                  (acceleration magnitude)
+@   a_vec  = -a_mag * r_vec / r       (toward planet)
+@   v     += a_vec                    (semi-implicit Euler: kick first)
+@   p     += v                         (then drift)
+@
+@ We carry dx = planet - body (so the acceleration is +a_mag * (dx/r),
+@ already pointing toward the planet). For r2 below 1.0 (Q16 0x10000) the
+@ body is essentially on top of the primary; we skip the divide to avoid
+@ numerical nonsense.
+@
+@ Caller-side: PLANET_X_Q16, PLANET_Y_Q16, MU_Q16 must be in the symbol
+@ table when this file is assembled.
+@ ----------------------------------------------------------------------------
+cowell_step:
+        push    {r4-r11, lr}
+        mov     r4, r0                  @ state ptr
+        ldr     r5, [r4, #0]            @ x
+        ldr     r6, [r4, #4]            @ y
+        ldr     r7, [r4, #8]            @ vx
+        ldr     r8, [r4, #12]           @ vy
+
+        ldr     r0, =PLANET_X_Q16
+        sub     r9, r0, r5              @ dx = planet_x - x
+        ldr     r0, =PLANET_Y_Q16
+        sub     r10, r0, r6             @ dy = planet_y - y
+
+        @ r2 = dx*dx + dy*dy
+        mov     r0, r9
+        mov     r1, r9
+        bl      fx_mul_q16
+        mov     r11, r0                 @ r11 = dx*dx
+        mov     r0, r10
+        mov     r1, r10
+        bl      fx_mul_q16              @ r0 = dy*dy
+        add     r11, r11, r0            @ r11 = r2 (Q16)
+
+        @ Skip gravity if too close (avoids div-by-zero, also numerically nuts).
+        cmp     r11, #0x10000           @ < 1.0 (Q16)?
+        blt     _cs_skip_grav
+
+        @ Keep r2 alive across calls; compute r = sqrt(r2).
+        mov     r0, r11
+        bl      fx_sqrt_q16
+        push    {r0}                    @ stack: [r]
+
+        @ a_mag = MU / r2
+        ldr     r0, =MU_Q16
+        mov     r1, r11
+        bl      fx_div_q16
+        push    {r0}                    @ stack: [a, r]
+
+        @ ax = a * (dx / r)
+        mov     r0, r9
+        ldr     r1, [sp, #4]            @ r
+        bl      fx_div_q16              @ ux = dx / r
+        ldr     r1, [sp]                @ a
+        bl      fx_mul_q16              @ ax
+        add     r7, r7, r0              @ vx += ax
+
+        @ ay = a * (dy / r)
+        mov     r0, r10
+        ldr     r1, [sp, #4]            @ r
+        bl      fx_div_q16              @ uy = dy / r
+        ldr     r1, [sp]                @ a
+        bl      fx_mul_q16              @ ay
+        add     r8, r8, r0              @ vy += ay
+
+        add     sp, sp, #8              @ drop [a, r]
+
+_cs_skip_grav:
+        @ Drift: p += v
+        add     r5, r5, r7
+        add     r6, r6, r8
+
+        str     r5, [r4, #0]
+        str     r6, [r4, #4]
+        str     r7, [r4, #8]
+        str     r8, [r4, #12]
+
+        pop     {r4-r11, lr}
         bx      lr

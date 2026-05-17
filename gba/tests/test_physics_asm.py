@@ -197,3 +197,170 @@ def test_fx_atan2_matches_reference(physics_blob):
         # (which sees the BIOS doing the same logic in our simulator) should
         # match exactly.
         assert arm == ref, f"y={y} x={x}: arm={arm:04X} ref={ref:04X}"
+
+
+# --- cowell_step ---------------------------------------------------------
+#
+# Behavioural Python reference mirroring `src/physics.s::cowell_step` step-by-
+# step using the same fx_* primitives. The integrator is semi-implicit Euler
+# (kick-then-drift) with dt = 1 frame; gravity from a single fixed primary.
+# This is *not* the more general `toolchain/orbit.py` reference (which does
+# substeps and an origin-centred primary); it's a tight match for what the
+# in-ROM routine does, so bit-identity is exact.
+
+_PLANET_X_Q16 = 120 << 16
+_PLANET_Y_Q16 = 80 << 16
+_MU_Q16       = 30 << 16
+
+
+def _cowell_step_py(x, y, vx, vy):
+    dx = _PLANET_X_Q16 - x
+    dy = _PLANET_Y_Q16 - y
+    r2 = py_fx_mul_q16(dx, dx) + py_fx_mul_q16(dy, dy)
+    if r2 < 0x10000:
+        # below threshold: skip gravity, just drift
+        x += vx
+        y += vy
+        return x, y, vx, vy
+    r = py_fx_sqrt_q16(r2)
+    a = py_fx_div_q16(_MU_Q16, r2)
+    ux = py_fx_div_q16(dx, r)
+    uy = py_fx_div_q16(dy, r)
+    vx += py_fx_mul_q16(a, ux)
+    vy += py_fx_mul_q16(a, uy)
+    x += vx
+    y += vy
+    return x, y, vx, vy
+
+
+@pytest.fixture(scope="module")
+def cowell_blob(physics_blob):
+    # physics.s defines defaults `.equ PLANET_X_Q16=120<<16, PLANET_Y_Q16=80<<16,
+    # MU_Q16=30<<16` that match the constants used by the Python reference
+    # above, so the same blob is fine.
+    return physics_blob
+
+
+def _arm_cowell_step(blob, x, y, vx, vy):
+    cpu = ArmCpu()
+    cpu.load_code(blob.bytes_, at=_BASE)
+    # Stage state at memory_off 0x1000 (well clear of code).
+    state_addr = 0x1000
+    cpu.write_u32(state_addr,      x  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 4,  y  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 8,  vx & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 12, vy & 0xFFFFFFFF)
+    cpu.set_reg(0, state_addr)
+    cpu.set_reg(13, 0x10000)   # SP somewhere safe
+    cpu.call(blob.symbols["cowell_step"])
+    nx  = cpu.get_reg_s32(0)   # not the actual return -- read state back
+    return (
+        cpu.get_reg_s32(0) if False else int.from_bytes(
+            bytes(cpu.read_u32(state_addr).to_bytes(4, "little")), "little", signed=True),
+        # simpler: just decode each word as signed
+        _signed(cpu.read_u32(state_addr + 4)),
+        _signed(cpu.read_u32(state_addr + 8)),
+        _signed(cpu.read_u32(state_addr + 12)),
+    )
+
+
+def _signed(u: int) -> int:
+    return u - 0x100000000 if u & 0x80000000 else u
+
+
+def _arm_cowell(blob, x, y, vx, vy):
+    cpu = ArmCpu()
+    cpu.load_code(blob.bytes_, at=_BASE)
+    state_addr = 0x1000
+    cpu.write_u32(state_addr,      x  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 4,  y  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 8,  vx & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 12, vy & 0xFFFFFFFF)
+    cpu.set_reg(0, state_addr)
+    cpu.set_reg(13, 0x10000)
+    cpu.call(blob.symbols["cowell_step"])
+    return (
+        _signed(cpu.read_u32(state_addr)),
+        _signed(cpu.read_u32(state_addr + 4)),
+        _signed(cpu.read_u32(state_addr + 8)),
+        _signed(cpu.read_u32(state_addr + 12)),
+    )
+
+
+def test_cowell_step_no_motion_no_gravity_at_planet(cowell_blob):
+    """Body exactly at the planet: r2 falls below threshold, gravity skipped,
+    velocity zero, position unchanged."""
+    out = _arm_cowell(cowell_blob, _PLANET_X_Q16, _PLANET_Y_Q16, 0, 0)
+    assert out == (_PLANET_X_Q16, _PLANET_Y_Q16, 0, 0)
+
+
+def test_cowell_step_drift_at_modest_offset(cowell_blob):
+    """At a 100-px offset gravity is small but present; one step should bit-
+    match the Python reference."""
+    x0, y0 = _PLANET_X_Q16 + (100 << 16), _PLANET_Y_Q16
+    vx0, vy0 = 0, 1 << 14   # 0.25 px/frame downward
+    out = _arm_cowell(cowell_blob, x0, y0, vx0, vy0)
+    ref = _cowell_step_py(x0, y0, vx0, vy0)
+    assert out == ref
+
+
+def test_cowell_step_circular_orbit_starting_above(cowell_blob):
+    """Body at (planet, planet - 40) moving +x at v_circ. One step should
+    match the Python reference bit-for-bit."""
+    r_int = 40
+    r_q16 = r_int << 16
+    # v_circ = sqrt(MU/r) (real). In Q16: sqrt(MU_q16 * Q16 / r_q16)
+    # easier: compute from real value.
+    import math
+    v_circ = math.sqrt(30.0 / r_int)
+    vx0 = int(round(v_circ * (1 << 16)))
+    x0 = _PLANET_X_Q16
+    y0 = _PLANET_Y_Q16 - r_q16
+    out = _arm_cowell(cowell_blob, x0, y0, vx0, 0)
+    ref = _cowell_step_py(x0, y0, vx0, 0)
+    assert out == ref
+
+
+def test_cowell_step_fuzz_against_reference(cowell_blob):
+    """Inputs stay within +/- 100 px of the planet -- the game's playfield
+    fits inside that radius, and beyond ~170 px fx_mul_q16 starts saturating
+    differently than the ARM truncates (one of the documented Q16 corner
+    cases). Within range, bit-identity is exact."""
+    rng = random.Random(0xC0FFFE)
+    for _ in range(150):
+        x  = _PLANET_X_Q16 + rng.randint(-100, 100) * (1 << 16)
+        y  = _PLANET_Y_Q16 + rng.randint(-100, 100) * (1 << 16)
+        if x == _PLANET_X_Q16 and y == _PLANET_Y_Q16:
+            x += 1 << 16
+        vx = rng.randint(-(1 << 16), 1 << 16)
+        vy = rng.randint(-(1 << 16), 1 << 16)
+        out = _arm_cowell(cowell_blob, x, y, vx, vy)
+        ref = _cowell_step_py(x, y, vx, vy)
+        assert out == ref, (
+            f"cowell_step mismatch:\n"
+            f"  in  = (x={x:08X}, y={y:08X}, vx={vx:08X}, vy={vy:08X})\n"
+            f"  arm = {tuple(f'{v:08X}' for v in out)}\n"
+            f"  ref = {tuple(f'{v:08X}' for v in ref)}"
+        )
+
+
+def test_cowell_step_circular_orbit_stays_bounded(cowell_blob):
+    """Initialise a circular orbit; after 200 steps the radius should not have
+    blown up. Semi-implicit Euler isn't exactly energy-conserving but it's
+    symplectic, so the radius oscillates around the initial value."""
+    import math
+    r_int = 40
+    v_circ = math.sqrt(30.0 / r_int)
+    vx0 = int(round(v_circ * (1 << 16)))
+    x = _PLANET_X_Q16
+    y = _PLANET_Y_Q16 - (r_int << 16)
+    vx, vy = vx0, 0
+    for _ in range(200):
+        x, y, vx, vy = _cowell_step_py(x, y, vx, vy)
+    # Compute integer radius from planet.
+    dx_int = (x - _PLANET_X_Q16) >> 16
+    dy_int = (y - _PLANET_Y_Q16) >> 16
+    r_now = int(math.sqrt(dx_int * dx_int + dy_int * dy_int))
+    # Symplectic integrator bound: radius stays within +/- 20% of the start
+    # over 200 steps at this resolution.
+    assert 32 <= r_now <= 48, f"orbit radius drifted to {r_now} (initial 40)"
