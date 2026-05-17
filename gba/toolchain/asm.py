@@ -257,20 +257,25 @@ _COND_SUFFIXES = {
 
 
 def split_cond(mnemonic: str, base: str) -> tuple[str, int, bool]:
-    """Given e.g. 'movnes', return (base, cond, set_flags). 'mov' -> ('mov', AL, False)."""
+    """Given e.g. 'movnes', return (base, cond, set_flags). 'mov' -> ('mov', AL, False).
+
+    Cond suffix is matched BEFORE the trailing 's' so mnemonics like 'subhs'
+    (sub + hs) don't get mis-split as sub + h + s.
+    """
     m = mnemonic.lower()
     if not m.startswith(base):
         raise ValueError
     suffix = m[len(base):]
-    s_flag = False
     cond = ea.COND_AL
-    if suffix.endswith('s'):
+    if len(suffix) >= 2 and suffix[:2] in _COND_SUFFIXES:
+        cond = _COND_SUFFIXES[suffix[:2]]
+        suffix = suffix[2:]
+    s_flag = False
+    if suffix == 's':
         s_flag = True
-        suffix = suffix[:-1]
+        suffix = ''
     if suffix:
-        if suffix not in _COND_SUFFIXES:
-            raise ValueError(f"unknown condition {suffix!r} on {mnemonic}")
-        cond = _COND_SUFFIXES[suffix]
+        raise ValueError(f"unknown condition {suffix!r} on {mnemonic}")
     return base, cond, s_flag
 
 
