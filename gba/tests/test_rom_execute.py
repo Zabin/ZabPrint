@@ -93,9 +93,11 @@ def test_rom_runs_first_frame(rom_bytes):
     # DISPCNT was written?
     assert cpu.read_u32(IO_BASE) == 0x0403, "DISPCNT should be mode 3 + BG2"
 
-    # Ship state initialised?
-    assert cpu.read_u32(IWRAM_BASE)     == 120  # SHIP_X
-    assert cpu.read_u32(IWRAM_BASE + 4) == 80   # SHIP_Y
+    # Ship state initialised to Q16 positions (120 << 16, 80 << 16). With no
+    # input the friction term holds velocity at 0 and position drifts only by
+    # tiny rounding which is exactly zero with zero velocity.
+    assert cpu.read_u32(IWRAM_BASE)     == 120 << 16, "SHIP_X should boot at 120 (Q16)"
+    assert cpu.read_u32(IWRAM_BASE + 4) ==  80 << 16, "SHIP_Y should boot at 80 (Q16)"
 
 
 def test_rom_paints_ship_at_default_position(rom_bytes):
@@ -125,8 +127,9 @@ def test_rom_paints_ship_at_default_position(rom_bytes):
 
 
 def test_rom_responds_to_dpad_right(rom_bytes):
-    """Hold the Right button (active-low: bit 4 clear). The ship should have
-    moved right of its initial x=120 by at least 2 pixels per completed frame."""
+    """Hold the Right button (active-low: bit 4 clear). Thrust accumulates
+    into vx > 0, so the Q16 ship_x and ship_vx should both be strictly
+    positive after a few frames."""
     cpu = _FakeVCountCpu(regions=[
         (ROM_BASE,   2 * 1024 * 1024),
         (IWRAM_BASE, 32 * 1024),
@@ -134,15 +137,21 @@ def test_rom_responds_to_dpad_right(rom_bytes):
         (IO_BASE,    1024),
     ])
     cpu.load_code(rom_bytes, at=ROM_BASE)
-    # All buttons released except Right (bit 4 = 0 means pressed).
     cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x10)
 
     cpu.regs[15] = ROM_BASE
     cpu.run_for(120_000)
 
-    x = cpu.read_u32(IWRAM_BASE)
-    assert x > 120 and x % 2 == 0, f"holding Right should advance x by 2/frame; got x={x}"
-    assert cpu.read_u32(IWRAM_BASE + 4) == 80, "y should not change when only Right is held"
+    x_q16  = cpu.read_u32(IWRAM_BASE + 0x00)
+    y_q16  = cpu.read_u32(IWRAM_BASE + 0x04)
+    vx_q16 = cpu.read_u32(IWRAM_BASE + 0x08)
+
+    # signed view
+    if vx_q16 & 0x80000000:
+        vx_q16 -= 0x100000000
+    assert vx_q16 > 0, f"vx should be positive after holding Right; got 0x{cpu.read_u32(IWRAM_BASE+8):08X}"
+    assert x_q16 > (120 << 16), f"ship_x should drift right; got 0x{x_q16:08X}"
+    assert y_q16 == (80 << 16), "y must not change when only Right is held"
 
 
 def test_rom_responds_to_dpad_up(rom_bytes):
@@ -153,12 +162,43 @@ def test_rom_responds_to_dpad_up(rom_bytes):
         (IO_BASE,    1024),
     ])
     cpu.load_code(rom_bytes, at=ROM_BASE)
-    # Up (bit 6).
     cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x40)
 
     cpu.regs[15] = ROM_BASE
     cpu.run_for(120_000)
 
-    y = cpu.read_u32(IWRAM_BASE + 4)
-    assert y < 80 and y % 2 == 0, f"holding Up should decrease y by 2/frame; got y={y}"
-    assert cpu.read_u32(IWRAM_BASE) == 120, "x should not change when only Up is held"
+    x_q16  = cpu.read_u32(IWRAM_BASE + 0x00)
+    y_q16  = cpu.read_u32(IWRAM_BASE + 0x04)
+    vy_q16 = cpu.read_u32(IWRAM_BASE + 0x0C)
+    if vy_q16 & 0x80000000:
+        vy_q16 -= 0x100000000
+
+    assert vy_q16 < 0, f"vy should be negative after holding Up; got vy=0x{cpu.read_u32(IWRAM_BASE+0xC):08X}"
+    assert y_q16 < (80 << 16), f"ship_y should drift up; got 0x{y_q16:08X}"
+    assert x_q16 == (120 << 16), "x must not change when only Up is held"
+
+
+def test_rom_a_button_spawns_projectile(rom_bytes):
+    """A-button on edge spawns a projectile; the slot should be active and
+    its Q16 position should equal the ship position at spawn-time."""
+    cpu = _FakeVCountCpu(regions=[
+        (ROM_BASE,   2 * 1024 * 1024),
+        (IWRAM_BASE, 32 * 1024),
+        (VRAM_BASE,  96 * 1024),
+        (IO_BASE,    1024),
+    ])
+    cpu.load_code(rom_bytes, at=ROM_BASE)
+    # Hold A (bit 0). The first frame edge-detects "newly pressed" since
+    # prev_keys boots at 0 and current's bit 0 is set.
+    cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x01)
+
+    cpu.regs[15] = ROM_BASE
+    cpu.run_for(80_000)   # roughly two frames
+
+    proj_on = cpu.read_u32(IWRAM_BASE + 0x24)
+    assert proj_on == 1, f"projectile slot should be active after A press; got {proj_on}"
+    # Projectile X should be moving right (positive vx) thanks to the kick.
+    proj_vx = cpu.read_u32(IWRAM_BASE + 0x1C)
+    if proj_vx & 0x80000000:
+        proj_vx -= 0x100000000
+    assert proj_vx > 0, f"projectile should have positive vx (forward kick); got 0x{cpu.read_u32(IWRAM_BASE+0x1C):08X}"
