@@ -280,34 +280,24 @@ def test_rom_dv_inits_at_max(rom_bytes):
     assert cpu.read_u32(IWRAM_BASE + 0x1C) == 0x00640000
 
 
-def test_rom_prograde_burn_drains_dv(rom_bytes):
-    """Holding Up triggers exactly one edge-detected prograde burn on the
-    first frame; ship_dv decrements by one THRUST_COST unit (1<<16)."""
-    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x40)
+def test_rom_in_track_burn_drains_dv(rom_bytes):
+    """Holding Right triggers exactly one edge-detected in-track (prograde-
+    like) burn on the first frame; ship_dv decrements by one THRUST_COST."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x10)
     cpu.run_for(400_000)
     dv = cpu.read_u32(IWRAM_BASE + 0x1C)
-    # Multi-frame run: edge-detect means only ONE burn (first frame). After
-    # that prev_keys == current_keys so bic returns 0 for the Up bit.
     assert dv == 0x00640000 - 0x00010000, \
         f"one burn should drop ship_dv by THRUST_COST; got 0x{dv:08X}"
 
 
-def test_rom_prograde_burn_grows_speed(rom_bytes):
-    """Prograde adds +BURN_DV along the unit v-vector. At boot v = (v_circ, 0),
-    so prograde changes vx by +BURN_DV exactly. Orbital motion then evolves
-    state, but |v| after one burn should remain strictly above the pre-burn
-    circular-orbit |v|."""
-    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x40)
-    # Need enough cycles for: init -> first frame's vsync polls -> input
-    # read -> burn dispatch -> cowell_step on 4 bodies -> clear loop. The
-    # clear loop alone is ~38k instructions.
+def test_rom_in_track_burn_grows_speed(rom_bytes):
+    """Right (in-track) adds +BURN_DV * v̂ to velocity. Boot v = (v_circ, 0),
+    so vx grows by +BURN_DV. Orbital motion then evolves but vx stays above
+    the boot circular value for the first frame after the burn."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x10)
     cpu.run_for(80_000)
     vx = _s32(cpu.read_u32(IWRAM_BASE + 0x08))
-    # Boot circular speed magnitude ~ 56756. After one prograde burn,
-    # vx grew by +BURN_DV = 0x4000 in the burn block, then cowell_step
-    # added the gravity kick (vy received a small negative bump, vx a
-    # tiny one). |v| should be strictly above the boot circular value.
-    assert vx > 56756, f"prograde should grow vx; got 0x{vx:08X}"
+    assert vx > 56756, f"in-track burn should grow vx; got 0x{vx:08X}"
 
 
 def test_rom_player_stays_bounded_under_orbit(rom_bytes):

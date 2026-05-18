@@ -82,7 +82,7 @@
         .equ MU_Q16,       0x001E0000
 
         .equ THRUST,      0x2000          @ legacy ΔV-free thrust (kept for now)
-        .equ BURN_DV,     0x4000          @ 0.25 in Q16; magnitude of every burn impulse
+        .equ BURN_DV,     0x1000          @ 0.0625 in Q16 (1/16 px/frame); subtle nudges
         .equ DV_MAX,      0x00640000      @ 100 in Q16 -- starting ΔV tank
         .equ THRUST_COST, 0x00010000      @ 1 unit per impulse (Q16)
         .equ MIN_V_FOR_PROGRADE, 0x100    @ avoid div-by-near-zero when |v| ~ 0
@@ -206,11 +206,17 @@ wait_start_vblank:
         bl      fx_sqrt_q16
         mov     r8, r0                          @ r8 = |r|
 
-        @ ---- Up: prograde -- impulse = +BURN_DV * (vx, vy)/|v|
-        tst     r4, #0x40
-        beq     skip_up
+        @ Direction mapping (user-locked):
+        @   Right (bit 4) = +in-track   (~prograde for near-circular orbits)
+        @   Left  (bit 5) = -in-track   (~retrograde)
+        @   Up    (bit 6) = +radial     (away from primary)
+        @   Down  (bit 7) = -radial     (toward primary)
+
+        @ ---- Right: +in-track  (impulse = +BURN_DV * (vx, vy)/|v|)
+        tst     r4, #0x10
+        beq     skip_right
         cmp     r5, #MIN_V_FOR_PROGRADE
-        ble     skip_up
+        ble     skip_right
         ldr     r12, =STATE
         ldr     r0, [r12, #(S_PLAYER + 8)]
         mov     r1, r5
@@ -227,13 +233,13 @@ wait_start_vblank:
         mov     r1, r0
         mov     r0, r9
         bl      _apply_burn
-skip_up:
+skip_right:
 
-        @ ---- Down: retrograde
-        tst     r4, #0x80
-        beq     skip_down
+        @ ---- Left: -in-track
+        tst     r4, #0x20
+        beq     skip_left
         cmp     r5, #MIN_V_FOR_PROGRADE
-        ble     skip_down
+        ble     skip_left
         ldr     r12, =STATE
         ldr     r0, [r12, #(S_PLAYER + 8)]
         mov     r1, r5
@@ -250,11 +256,11 @@ skip_up:
         rsb     r1, r0, #0                      @ -dvy
         mov     r0, r9
         bl      _apply_burn
-skip_down:
+skip_left:
 
-        @ ---- Right: radial-out -- impulse = +BURN_DV * (rx, ry)/|r|
-        tst     r4, #0x10
-        beq     skip_right
+        @ ---- Up: +radial-out  (impulse = +BURN_DV * (rx, ry)/|r|)
+        tst     r4, #0x40
+        beq     skip_up
         mov     r0, r6
         mov     r1, r8
         bl      fx_div_q16
@@ -269,11 +275,11 @@ skip_down:
         mov     r1, r0
         mov     r0, r9
         bl      _apply_burn
-skip_right:
+skip_up:
 
-        @ ---- Left: radial-in
-        tst     r4, #0x20
-        beq     skip_left
+        @ ---- Down: -radial (toward primary)
+        tst     r4, #0x80
+        beq     skip_down
         mov     r0, r6
         mov     r1, r8
         bl      fx_div_q16
@@ -288,7 +294,7 @@ skip_right:
         rsb     r1, r0, #0
         mov     r0, r9
         bl      _apply_burn
-skip_left:
+skip_down:
 
 burns_done:
 
