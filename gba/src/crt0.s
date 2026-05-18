@@ -48,6 +48,7 @@
         .equ S_T2,        0x40
         .equ S_PLAYER_EL, 0x50          @ player elements  { a, e, omega, nu } Q16
         .equ S_TARGET_EL, 0x60          @ target 0 elements (cached for HUD)
+        .equ S_WARP,      0x70          @ time-warp substep count (1, 10, 100)
 
         @ Tuning: planet at screen centre, MU sized for ~4-second orbits at
         @ radius 40 pixels. These match the defaults in physics.s.
@@ -69,10 +70,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (28 words: 80 B state + 32 B element cache).
+        @ Zero the state block (29 words: 80 B state + 32 B element cache + 4 B warp).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #28
+        mov     r2, #29
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -91,10 +92,12 @@ init_z:
         bl      _copy_orbit_body
         bl      _copy_orbit_body
 
-        @ Initialise ship_dv = DV_MAX.
+        @ Initialise ship_dv = DV_MAX, warp = 1.
         ldr     r0, =STATE
         ldr     r1, =DV_MAX
         str     r1, [r0, #S_SHIP_DV]
+        mov     r1, #1
+        str     r1, [r0, #S_WARP]
 
 frame_loop:
         @ -------- vsync -----------------------------------------------
@@ -128,13 +131,12 @@ wait_start_vblank:
         @ Each impulse adds BURN_DV * unit-vector to velocity and costs
         @ THRUST_COST from ship_dv. Skip everything if no D-pad press or
         @ DV exhausted.
-        tst     r1, #0xF0
+        mov     r4, r1                          @ always cache newly-pressed (used by warp cycle too)
+        tst     r4, #0xF0
         beq     burns_done
         ldr     r2, [r12, #S_SHIP_DV]
         cmp     r2, #0
         ble     burns_done
-
-        mov     r4, r1                          @ stash newly-pressed mask
 
         @ Compute |v|.
         ldr     r0, [r12, #(S_PLAYER + 8)]
@@ -256,7 +258,42 @@ skip_left:
 
 burns_done:
 
-        @ -------- Cowell step on each body ----------------------------
+        @ -------- R / L: cycle time warp 1 / 10 / 100 -----------------
+        tst     r4, #0x100                      @ R
+        beq     no_warp_r
+        ldr     r12, =STATE
+        ldr     r5, [r12, #S_WARP]
+        cmp     r5, #1
+        moveq   r5, #10
+        beq     warp_store_r
+        cmp     r5, #10
+        moveq   r5, #100
+        beq     warp_store_r
+        mov     r5, #1
+warp_store_r:
+        str     r5, [r12, #S_WARP]
+no_warp_r:
+        tst     r4, #0x200                      @ L
+        beq     no_warp_l
+        ldr     r12, =STATE
+        ldr     r5, [r12, #S_WARP]
+        cmp     r5, #100
+        moveq   r5, #10
+        beq     warp_store_l
+        cmp     r5, #10
+        moveq   r5, #1
+        beq     warp_store_l
+        mov     r5, #100
+warp_store_l:
+        str     r5, [r12, #S_WARP]
+no_warp_l:
+
+        @ -------- Substep loop: cowell_step on each body, WARP times --
+        ldr     r12, =STATE
+        ldr     r5, [r12, #S_WARP]
+warp_substep_loop:
+        cmp     r5, #0
+        ble     warp_substep_done
         ldr     r0, =STATE
         bl      cowell_step                     @ player
         ldr     r0, =STATE
@@ -268,6 +305,9 @@ burns_done:
         ldr     r0, =STATE
         add     r0, r0, #S_T2
         bl      cowell_step
+        sub     r5, r5, #1
+        b       warp_substep_loop
+warp_substep_done:
 
         @ -------- orbital elements: cache for HUD ---------------------
         ldr     r12, =STATE
@@ -511,6 +551,19 @@ skip_score:
         mov     r0, #2
         mov     r1, #10
         ldr     r3, =0x023F                     @ dim yellow
+        bl      _draw_hbar
+
+        @ Warp HUD: yellow indicator at (115, 1), length = log10(warp)+1
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_WARP]
+        mov     r2, #1
+        cmp     r0, #10
+        moveq   r2, #2
+        cmp     r0, #100
+        moveq   r2, #3
+        mov     r0, #115
+        mov     r1, #1
+        ldr     r3, =0x03FF                     @ bright yellow
         bl      _draw_hbar
 
         b       frame_loop

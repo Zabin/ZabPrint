@@ -153,6 +153,39 @@ def test_rom_orbital_motion_advances_targets(rom_bytes):
     assert t0_y > 80 << 16, f"target 0 y should be > 80<<16; got 0x{t0_y:08X}"
 
 
+def test_rom_warp_inits_to_one(rom_bytes):
+    """S_WARP at IWRAM 0x70 boots to 1 (real time)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(1500)
+    assert cpu.read_u32(IWRAM_BASE + 0x70) == 1
+
+
+def test_rom_r_cycles_warp_up(rom_bytes):
+    """Pressing R once advances 1 -> 10."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x100)
+    cpu.run_for(80_000)
+    assert cpu.read_u32(IWRAM_BASE + 0x70) == 10
+
+
+def test_rom_warp_accelerates_orbit(rom_bytes):
+    """At warp=1, target 0 advances slightly per frame. At warp=10, it
+    advances ~10x as much in the same wall-clock cycles."""
+    # Reference run: warp=1
+    cpu_ref = _make_cpu(rom_bytes)
+    cpu_ref.run_for(400_000)
+    ref_y = _s32(cpu_ref.read_u32(IWRAM_BASE + 0x24)) >> 16
+
+    # Warp run: press R once to get warp=10
+    cpu_warp = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x100)
+    cpu_warp.run_for(400_000)
+    warp_y = _s32(cpu_warp.read_u32(IWRAM_BASE + 0x24)) >> 16
+
+    # Target 0 starts at y=80 moving +y. After many substeps at warp=10
+    # it should have travelled further from the start than at warp=1.
+    assert abs(warp_y - 80) > abs(ref_y - 80), \
+        f"warp=10 should advance target faster; got warp_y={warp_y} ref_y={ref_y}"
+
+
 def test_rom_dv_inits_at_max(rom_bytes):
     """ship_dv at IWRAM 0x1C should boot to DV_MAX = 100 (Q16)."""
     cpu = _make_cpu(rom_bytes)
