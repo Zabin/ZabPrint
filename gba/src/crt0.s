@@ -62,6 +62,9 @@
         .equ S_HOLD_TIMERS,       0x9C  @ 3 words: per-target hold-at-risk frame counters
         .equ S_DEW_COOLDOWN,      0xA8
         .equ S_T_HEALTH,          0xAC  @ 3 words: per-target health for DEW (3 -> 0)
+        .equ S_PLAYER_PLANE,      0xB8
+        .equ S_T_PLANE,           0xBC  @ 3 words: per-target plane flag (0 or 1)
+        .equ PLANE_CHANGE_DV,     0x00190000   @ 25 (Q16) cost to flip planes
         .equ HOLD_DIST_SQ,        144   @ 12 px squared
         .equ HOLD_THRESH,         90    @ frames to trigger Deny completion
         .equ DEW_RANGE_SQ,        4900  @ 70 px squared
@@ -90,10 +93,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (46 words: 42 prior + DEW + per-target health).
+        @ Zero the state block (50 words: 46 prior + 16 B plane state).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #46
+        mov     r2, #50
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -122,6 +125,13 @@ init_z:
         str     r1, [r0, #(S_T_HEALTH + 0)]
         str     r1, [r0, #(S_T_HEALTH + 4)]
         str     r1, [r0, #(S_T_HEALTH + 8)]
+        @ Initial planes: t0 = 0, t1 = 1, t2 = 0  (a second plane to exercise the cost)
+        mov     r1, #0
+        str     r1, [r0, #(S_T_PLANE + 0)]
+        mov     r1, #1
+        str     r1, [r0, #(S_T_PLANE + 4)]
+        mov     r1, #0
+        str     r1, [r0, #(S_T_PLANE + 8)]
 
 frame_loop:
         @ -------- vsync -----------------------------------------------
@@ -321,6 +331,21 @@ no_warp_l:
         str     r5, [r12, #S_VIEW_MODE]
 no_view_toggle:
 
+        @ -------- START (bit 3): plane change, costs PLANE_CHANGE_DV ----
+        tst     r4, #0x08
+        beq     no_plane_change
+        ldr     r12, =STATE
+        ldr     r5, [r12, #S_SHIP_DV]
+        ldr     r6, =PLANE_CHANGE_DV
+        cmp     r5, r6
+        blt     no_plane_change
+        sub     r5, r5, r6
+        str     r5, [r12, #S_SHIP_DV]
+        ldr     r5, [r12, #S_PLAYER_PLANE]
+        eor     r5, r5, #1
+        str     r5, [r12, #S_PLAYER_PLANE]
+no_plane_change:
+
         @ -------- DEW (B button, edge-detected, cooldown-gated) -------
         @ Decrement cooldown first; even if B isn't pressed.
         ldr     r12, =STATE
@@ -347,6 +372,12 @@ dew_cd_done:
         add     r1, r1, #1                      @ best dist² (just outside range)
         mov     r2, #0                          @ iter i
 dew_scan_loop:
+        @ Skip if target is on a different plane than player.
+        add     r3, r12, r2, lsl #2
+        ldr     r3, [r3, #S_T_PLANE]
+        ldr     r7, [r12, #S_PLAYER_PLANE]
+        cmp     r3, r7
+        bne     dew_scan_next
         mov     r3, r2, lsl #4
         add     r3, r3, #S_T0
         add     r7, r12, r3
@@ -459,6 +490,12 @@ warp_substep_done:
         mov     r5, r1, asr #16
         mov     r6, #0
 hold_check_loop:
+        @ Skip cross-plane targets (no hold accumulates).
+        add     r7, r12, r6, lsl #2
+        ldr     r7, [r7, #S_T_PLANE]
+        ldr     r0, [r12, #S_PLAYER_PLANE]
+        cmp     r7, r0
+        bne     hold_zero_skip
         mov     r7, r6, lsl #4
         add     r7, r7, #S_T0
         add     r8, r12, r7
@@ -498,6 +535,13 @@ hold_store:
         bl      _advance_mission
         pop     {r4, r5, r6, r12, lr}
 hold_skip_mission:
+        b       hold_advance
+hold_zero_skip:
+        @ Cross-plane: zero this target's hold timer.
+        add     r0, r12, r6, lsl #2
+        mov     r1, #0
+        str     r1, [r0, #S_HOLD_TIMERS]
+hold_advance:
         add     r6, r6, #1
         cmp     r6, #3
         blt     hold_check_loop

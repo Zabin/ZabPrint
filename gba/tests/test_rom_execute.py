@@ -157,6 +157,24 @@ def test_rom_orbital_motion_advances_targets(rom_bytes):
     assert t0_y > 80 << 16, f"target 0 y should be > 80<<16; got 0x{t0_y:08X}"
 
 
+def test_rom_player_plane_inits_zero(rom_bytes):
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(1500)
+    assert cpu.read_u32(IWRAM_BASE + 0xB8) == 0   # player_plane
+
+
+def test_rom_start_toggles_plane_costs_dv(rom_bytes):
+    """Pressing START with sufficient ΔV flips player_plane and subtracts
+    PLANE_CHANGE_DV (25 << 16)."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x08)
+    cpu.run_for(80_000)
+    plane = cpu.read_u32(IWRAM_BASE + 0xB8)
+    dv = cpu.read_u32(IWRAM_BASE + 0x1C)
+    assert plane == 1, f"plane should flip to 1; got {plane}"
+    assert dv == 0x00640000 - 0x00190000, \
+        f"plane change should cost 25 ΔV; ship_dv now 0x{dv:08X}"
+
+
 def test_rom_dew_fires_on_b_press(rom_bytes):
     """Holding B for the first frame triggers a DEW shot at the nearest in-
     range target. Boot positions: player (120, 40), target 0 (170, 80) ->
