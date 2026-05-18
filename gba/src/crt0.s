@@ -839,98 +839,241 @@ star_skip:
         strh    r1, [r0]
 skip_nose:
 
-        @ -------- score bar (green pixels at top-left) -----------------
-        ldr     r12, =STATE
-        ldr     r0, [r12, #S_SCORE]
-        cmp     r0, #0
-        beq     skip_score
-        cmp     r0, #50
-        movgt   r0, #50
-        ldr     r1, =(0x06000000 + 482)         @ VRAM + (2*240 + 1)*2
-        ldr     r2, =0x03E0                     @ bright green
-score_loop:
-        strh    r2, [r1]
-        add     r1, r1, #2
-        subs    r0, r0, #1
-        bne     score_loop
-skip_score:
+        @ ============ Labeled HUD (Layer 8e) ============================
+        @ Layout (y top -> bottom):
+        @   y=2   DV   bar       value
+        @   y=10  a    bar       value
+        @   y=18  e    bar       value
+        @   y=26  Ta   bar       value
+        @   y=34  Te   bar       value
+        @   y=44  WRP n  MIS xxx  VIEW xxx  PLN n
+        @   y=145 SCORE nnnn
+        @
+        @ Label x=2..11 (DV is 9 px), bar x=20..120 (max len 100),
+        @ value x=125..139 (3 digits * 5 px wide).
+        @ ----------------------------------------------------------------
 
-        @ -------- element HUD bars -----------------------------------
-        @ Player a (cyan, y=3): length = a >> 16 (clamped 0..100)
+        @ --- Row 1: DV
+        ldr     r0, =str_dv
+        mov     r1, #2
+        mov     r2, #2
+        ldr     r3, =0x7FFF                     @ white label
+        bl      _draw_str
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_SHIP_DV]
+        cmp     r0, #0
+        movlt   r0, #0
+        ldr     r2, =DV_MAX
+        cmp     r0, r2
+        movgt   r0, r2
+        mov     r0, r0, asr #16                 @ DV in integer 0..100
+        @ Length proportional to DV/100 * 100 = DV directly (capped 0..100)
+        mov     r2, r0
+        push    {r0}
+        mov     r0, #20
+        mov     r1, #4
+        ldr     r3, =0x7FE0                     @ cyan bar
+        bl      _draw_hbar
+        pop     {r0}
+        @ Numeric value
+        mov     r1, #125
+        mov     r2, #2
+        ldr     r3, =0x7FFF
+        bl      _draw_dec
+
+        @ --- Row 2: a (player)
+        ldr     r0, =str_a
+        mov     r1, #2
+        mov     r2, #10
+        ldr     r3, =0x7FFF
+        bl      _draw_str
         ldr     r12, =STATE
         ldr     r0, [r12, #S_PLAYER_EL]
         bl      _hud_a_len_clamped
         mov     r2, r0
-        mov     r0, #2
-        mov     r1, #3
+        push    {r0}
+        mov     r0, #20
+        mov     r1, #12
         ldr     r3, =0x7FE0                     @ cyan
         bl      _draw_hbar
-        @ Player e (yellow, y=5): length = e >> 11 (clamped 0..40)
+        pop     {r0}
+        @ Print integer a (Q16 >> 16)
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_PLAYER_EL]
+        cmp     r0, #0
+        movlt   r0, #0
+        mov     r0, r0, asr #16
+        cmp     r0, #0xFF
+        movgt   r0, #0xFF
+        mov     r1, #125
+        mov     r2, #10
+        ldr     r3, =0x7FFF
+        bl      _draw_dec
+
+        @ --- Row 3: e (player)
+        ldr     r0, =str_e
+        mov     r1, #2
+        mov     r2, #18
+        ldr     r3, =0x7FFF
+        bl      _draw_str
         ldr     r12, =STATE
         ldr     r0, [r12, #(S_PLAYER_EL + 4)]
         bl      _hud_e_len_clamped
         mov     r2, r0
-        mov     r0, #2
-        mov     r1, #5
-        ldr     r3, =0x03FF                     @ bright yellow
+        mov     r0, #20
+        mov     r1, #20
+        ldr     r3, =0x03FF                     @ yellow
         bl      _draw_hbar
-        @ Target 0 a (dim cyan, y=8)
+        @ Print e as 2-digit percent: (e_q16 * 100) >> 16
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER_EL + 4)]
+        cmp     r0, #0
+        movlt   r0, #0
+        mov     r1, #100
+        mul     r0, r0, r1
+        mov     r0, r0, asr #16
+        cmp     r0, #0xFF
+        movgt   r0, #0xFF
+        mov     r1, #125
+        mov     r2, #18
+        ldr     r3, =0x7FFF
+        bl      _draw_dec
+
+        @ --- Row 4: Ta (target a)
+        ldr     r0, =str_ta
+        mov     r1, #2
+        mov     r2, #26
+        ldr     r3, =0x4310                     @ dim cyan
+        bl      _draw_str
         ldr     r12, =STATE
         ldr     r0, [r12, #S_TARGET_EL]
         bl      _hud_a_len_clamped
         mov     r2, r0
-        mov     r0, #2
-        mov     r1, #8
-        ldr     r3, =0x4310                     @ dim cyan
+        mov     r0, #20
+        mov     r1, #28
+        ldr     r3, =0x4310
         bl      _draw_hbar
-        @ Target 0 e (dim yellow, y=10)
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_TARGET_EL]
+        cmp     r0, #0
+        movlt   r0, #0
+        mvn     r2, #0x80000000                 @ INT32_MAX hyperbolic sentinel
+        cmp     r0, r2
+        moveq   r0, #0xFF
+        bne     _ta_inrange
+        b       _ta_print
+_ta_inrange:
+        mov     r0, r0, asr #16
+        cmp     r0, #0xFF
+        movgt   r0, #0xFF
+_ta_print:
+        mov     r1, #125
+        mov     r2, #26
+        ldr     r3, =0x4310
+        bl      _draw_dec
+
+        @ --- Row 5: Te (target e)
+        ldr     r0, =str_te
+        mov     r1, #2
+        mov     r2, #34
+        ldr     r3, =0x023F                     @ dim yellow
+        bl      _draw_str
         ldr     r12, =STATE
         ldr     r0, [r12, #(S_TARGET_EL + 4)]
         bl      _hud_e_len_clamped
         mov     r2, r0
-        mov     r0, #2
-        mov     r1, #10
-        ldr     r3, =0x023F                     @ dim yellow
+        mov     r0, #20
+        mov     r1, #36
+        ldr     r3, =0x023F
         bl      _draw_hbar
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_TARGET_EL + 4)]
+        cmp     r0, #0
+        movlt   r0, #0
+        mov     r1, #100
+        mul     r0, r0, r1
+        mov     r0, r0, asr #16
+        cmp     r0, #0xFF
+        movgt   r0, #0xFF
+        mov     r1, #125
+        mov     r2, #34
+        ldr     r3, =0x023F
+        bl      _draw_dec
 
-        @ Warp HUD: yellow indicator at (115, 1), length = log10(warp)+1
+        @ --- Row 6: WRP n  MIS xxx  VIEW xxx  PLN n
+        ldr     r0, =str_wrp
+        mov     r1, #2
+        mov     r2, #44
+        ldr     r3, =0x7FFF
+        bl      _draw_str
         ldr     r12, =STATE
         ldr     r0, [r12, #S_WARP]
-        mov     r2, #1
-        cmp     r0, #10
-        moveq   r2, #2
-        cmp     r0, #100
-        moveq   r2, #3
-        mov     r0, #115
-        mov     r1, #1
-        ldr     r3, =0x03FF                     @ bright yellow
-        bl      _draw_hbar
+        mov     r1, #22
+        mov     r2, #44
+        ldr     r3, =0x03FF                     @ yellow
+        bl      _draw_dec
 
-        @ Mission HUD: 5-pixel bar at (118, 4) colour-coded by mission_id.
+        ldr     r0, =str_mis
+        mov     r1, #50
+        mov     r2, #44
+        ldr     r3, =0x7FFF
+        bl      _draw_str
         ldr     r12, =STATE
-        ldr     r0, [r12, #S_MISSION_ID]
-        cmp     r0, #5
-        movge   r0, #0                          @ guard out-of-range
+        ldr     r4, [r12, #S_MISSION_ID]
+        cmp     r4, #5
+        movge   r4, #0
+        ldr     r0, =mission_names
+        add     r0, r0, r4, lsl #2
+        ldr     r0, [r0]
         ldr     r1, =mission_color_table
-        add     r1, r1, r0, lsl #2
+        add     r1, r1, r4, lsl #2
         ldr     r3, [r1]
-        mov     r2, #5
-        mov     r0, #118
-        mov     r1, #4
-        bl      _draw_hbar
+        mov     r1, #70
+        mov     r2, #44
+        bl      _draw_str
 
-        @ ECI / RIC mode indicator at (230, 1): 1 px white = ECI, 4 px = RIC
+        ldr     r0, =str_view
+        mov     r1, #100
+        mov     r2, #44
+        ldr     r3, =0x7FFF
+        bl      _draw_str
         ldr     r12, =STATE
-        ldr     r0, [r12, #S_VIEW_MODE]
-        mov     r2, #1
-        cmp     r0, #0
-        movne   r2, #4                          @ RIC -> 4 pixels
-        ldr     r3, =0x7FFF                     @ white in ECI
-        cmp     r0, #0
-        ldrne   r3, =0x03FF                     @ yellow in RIC
-        mov     r0, #230
-        mov     r1, #1
-        bl      _draw_hbar
+        ldr     r4, [r12, #S_VIEW_MODE]
+        cmp     r4, #0
+        ldreq   r0, =str_eci
+        ldrne   r0, =str_ric
+        ldreq   r3, =0x7FFF
+        ldrne   r3, =0x03FF
+        mov     r1, #125
+        mov     r2, #44
+        bl      _draw_str
+
+        ldr     r0, =str_pln
+        mov     r1, #150
+        mov     r2, #44
+        ldr     r3, =0x7FFF
+        bl      _draw_str
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_PLAYER_PLANE]
+        mov     r1, #168
+        mov     r2, #44
+        ldr     r3, =0x7FFF
+        bl      _draw_dec
+
+        @ --- Bottom row: SCORE nnnn (y=145)
+        ldr     r0, =str_score
+        mov     r1, #2
+        mov     r2, #145
+        ldr     r3, =0x03E0                     @ bright green
+        bl      _draw_str
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_SCORE]
+        cmp     r0, #0x1000
+        movgt   r0, #0x1000
+        mov     r1, #32
+        mov     r2, #145
+        ldr     r3, =0x03E0
+        bl      _draw_dec4
 
         b       frame_loop
 
@@ -1502,6 +1645,161 @@ hbar_loop:
         bx      lr
 
 @ ----------------------------------------------------------------------------
+@ _draw_glyph(idx, x, y, color) -- paint a single 4x6 pixel glyph.
+@   r0 = glyph index, r1 = x, r2 = y, r3 = BGR555 colour
+@ Walks 6 rows; for each row's 4 LSB bits, paints the corresponding pixel
+@ if the bit is set. Per-pixel bounds-check against [0,240) x [0,160).
+@ Clobbers r4..r11.
+@ ----------------------------------------------------------------------------
+_draw_glyph:
+        push    {r4-r11, lr}
+        mov     r4, r3                          @ colour preserved across writes
+        @ glyph ptr = font_glyphs + idx*6
+        ldr     r5, =font_glyphs
+        mov     r6, r0, lsl #1
+        add     r6, r6, r0, lsl #2
+        add     r5, r5, r6                      @ r5 -> row bytes
+        mov     r6, r1                          @ x0 (left col)
+        mov     r7, r2                          @ y (current row)
+        mov     r8, #0                          @ row counter
+        ldr     r9, =VRAM
+_dgl_row:
+        add     r11, r5, r8
+        ldrb    r10, [r11]                      @ row byte
+        @ col 0 (bit 3)
+        tst     r10, #8
+        beq     _dgl_c1
+        mov     r0, r6
+        mov     r1, r7
+        bl      _glyph_px
+_dgl_c1:
+        tst     r10, #4
+        beq     _dgl_c2
+        add     r0, r6, #1
+        mov     r1, r7
+        bl      _glyph_px
+_dgl_c2:
+        tst     r10, #2
+        beq     _dgl_c3
+        add     r0, r6, #2
+        mov     r1, r7
+        bl      _glyph_px
+_dgl_c3:
+        tst     r10, #1
+        beq     _dgl_next
+        add     r0, r6, #3
+        mov     r1, r7
+        bl      _glyph_px
+_dgl_next:
+        add     r7, r7, #1
+        add     r8, r8, #1
+        cmp     r8, #6
+        blt     _dgl_row
+        pop     {r4-r11, lr}
+        bx      lr
+
+@ Inner helper: paint pixel at (r0, r1) with colour in r4, using VRAM in r9.
+@ Bounds-checked. Clobbers r2, r3, r11.
+_glyph_px:
+        cmp     r0, #0
+        bxlt    lr
+        cmp     r0, #240
+        bxge    lr
+        cmp     r1, #0
+        bxlt    lr
+        cmp     r1, #160
+        bxge    lr
+        mov     r2, #240
+        mul     r2, r1, r2
+        add     r2, r2, r0
+        add     r11, r9, r2, lsl #1
+        strh    r4, [r11]
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _draw_str(ptr, x, y, color) -- paint a 0xFF-terminated glyph-index string.
+@ Advances x by 5 px (4 px glyph + 1 px space) per character.
+@ Clobbers r4..r8.
+@ ----------------------------------------------------------------------------
+_draw_str:
+        push    {r4, r5, r6, r7, lr}
+        mov     r4, r0                          @ ptr
+        mov     r5, r1                          @ cur x
+        mov     r6, r2                          @ y
+        mov     r7, r3                          @ colour
+_dstr_loop:
+        ldrb    r0, [r4]
+        cmp     r0, #0xFF
+        beq     _dstr_done
+        mov     r1, r5
+        mov     r2, r6
+        mov     r3, r7
+        bl      _draw_glyph
+        add     r4, r4, #1
+        add     r5, r5, #5
+        b       _dstr_loop
+_dstr_done:
+        pop     {r4, r5, r6, r7, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _draw_dec(value, x_right, y, color) -- print 3-digit decimal at (x_right, y)
+@ in BIG-ENDIAN reading order. Leading zeros are kept (e.g. 7 -> "007").
+@   r0 = value (unsigned), r1 = x_right (top-left of leftmost digit),
+@   r2 = y, r3 = colour
+@ Always emits exactly 3 digits; caller picks the X for that field.
+@ Uses BIOS SWI 0x06 for divmod by 10.
+@ Clobbers r4..r8.
+@ ----------------------------------------------------------------------------
+_draw_dec:
+        push    {r4, r5, r6, r7, lr}
+        mov     r4, r0                          @ value
+        @ rightmost digit at x = x_right + 10  (2 * 5)
+        add     r5, r1, #10                     @ cur_x
+        mov     r6, r2                          @ y
+        mov     r7, r3                          @ colour
+        mov     r8, #3                          @ digits remaining
+_ddc_loop:
+        mov     r0, r4
+        mov     r1, #10
+        swi     0x060000                        @ r0 = quot, r1 = rem
+        mov     r4, r0
+        add     r0, r1, #1                      @ glyph index ('0' is at 1)
+        mov     r1, r5
+        mov     r2, r6
+        mov     r3, r7
+        bl      _draw_glyph
+        sub     r5, r5, #5
+        subs    r8, r8, #1
+        bne     _ddc_loop
+        pop     {r4, r5, r6, r7, lr}
+        bx      lr
+
+@ Same as _draw_dec but 4 digits. Used for SCORE.
+_draw_dec4:
+        push    {r4, r5, r6, r7, lr}
+        mov     r4, r0
+        add     r5, r1, #15                     @ 3 * 5
+        mov     r6, r2
+        mov     r7, r3
+        mov     r8, #4
+_ddc4_loop:
+        mov     r0, r4
+        mov     r1, #10
+        swi     0x060000
+        mov     r4, r0
+        add     r0, r1, #1
+        mov     r1, r5
+        mov     r2, r6
+        mov     r3, r7
+        bl      _draw_glyph
+        sub     r5, r5, #5
+        subs    r8, r8, #1
+        bne     _ddc4_loop
+        pop     {r4, r5, r6, r7, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
 @ _copy_orbit_body -- copy 16 bytes (1 body's worth) from r0 -> r1, advancing
 @ both pointers so callers can chain calls.
 @ ----------------------------------------------------------------------------
@@ -1676,5 +1974,105 @@ mission_color_table:
         .word   0x7C00
         .word   0x7FE0
         .word   0x03FF
+
+@ ----------------------------------------------------------------------------
+@ Pixel font: 4-wide x 6-tall glyphs, one byte per row, low 4 bits are pixels
+@ (bit 3 = leftmost). 30 glyphs * 6 = 180 bytes. Glyph indices:
+@   0=space  1..10='0'..'9'
+@   11='A' 12='C' 13='D' 14='E' 15='G' 16='I' 17='L' 18='M' 19='N' 20='O'
+@   21='P' 22='R' 23='S' 24='T' 25='V' 26='W' 27='Y'
+@   28='a' (lowercase)  29='e' (lowercase)
+@ ----------------------------------------------------------------------------
+        .align 2
+font_glyphs:
+        @ 0: space
+        .byte 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
+        @ 1: '0'
+        .byte 0x6, 0x9, 0x9, 0x9, 0x9, 0x6
+        @ 2: '1'
+        .byte 0x4, 0xC, 0x4, 0x4, 0x4, 0xE
+        @ 3: '2'
+        .byte 0xE, 0x1, 0x6, 0xC, 0x8, 0xF
+        @ 4: '3'
+        .byte 0xE, 0x1, 0x6, 0x1, 0x1, 0xE
+        @ 5: '4'
+        .byte 0x9, 0x9, 0xF, 0x1, 0x1, 0x1
+        @ 6: '5'
+        .byte 0xF, 0x8, 0xE, 0x1, 0x1, 0xE
+        @ 7: '6'
+        .byte 0x6, 0x8, 0xE, 0x9, 0x9, 0x6
+        @ 8: '7'
+        .byte 0xF, 0x1, 0x2, 0x4, 0x4, 0x4
+        @ 9: '8'
+        .byte 0x6, 0x9, 0x6, 0x9, 0x9, 0x6
+        @ 10: '9'
+        .byte 0x6, 0x9, 0x9, 0x7, 0x1, 0x6
+        @ 11: 'A'
+        .byte 0x6, 0x9, 0x9, 0xF, 0x9, 0x9
+        @ 12: 'C'
+        .byte 0x7, 0x8, 0x8, 0x8, 0x8, 0x7
+        @ 13: 'D'
+        .byte 0xE, 0x9, 0x9, 0x9, 0x9, 0xE
+        @ 14: 'E'
+        .byte 0xF, 0x8, 0xE, 0x8, 0x8, 0xF
+        @ 15: 'G'
+        .byte 0x7, 0x8, 0x8, 0xB, 0x9, 0x6
+        @ 16: 'I'
+        .byte 0xE, 0x4, 0x4, 0x4, 0x4, 0xE
+        @ 17: 'L'
+        .byte 0x8, 0x8, 0x8, 0x8, 0x8, 0xF
+        @ 18: 'M'
+        .byte 0x9, 0xF, 0xF, 0x9, 0x9, 0x9
+        @ 19: 'N'
+        .byte 0x9, 0xD, 0xF, 0xB, 0x9, 0x9
+        @ 20: 'O'
+        .byte 0x6, 0x9, 0x9, 0x9, 0x9, 0x6
+        @ 21: 'P'
+        .byte 0xE, 0x9, 0x9, 0xE, 0x8, 0x8
+        @ 22: 'R'
+        .byte 0xE, 0x9, 0x9, 0xE, 0xA, 0x9
+        @ 23: 'S'
+        .byte 0x7, 0x8, 0x6, 0x1, 0x1, 0xE
+        @ 24: 'T'
+        .byte 0xF, 0x4, 0x4, 0x4, 0x4, 0x4
+        @ 25: 'V'
+        .byte 0x9, 0x9, 0x9, 0x9, 0x6, 0x6
+        @ 26: 'W'
+        .byte 0x9, 0x9, 0x9, 0xF, 0xF, 0x9
+        @ 27: 'Y'
+        .byte 0x9, 0x9, 0x6, 0x4, 0x4, 0x4
+        @ 28: 'a' (lowercase)
+        .byte 0x0, 0x6, 0x3, 0x7, 0x9, 0x7
+        @ 29: 'e' (lowercase)
+        .byte 0x0, 0x6, 0x9, 0xE, 0x8, 0x7
+
+@ Label strings: byte arrays of glyph indices, 0xFF-terminated.
+        .align 2
+str_dv:    .byte 13, 25, 0xFF                  @ "DV"
+str_a:     .byte 28, 0xFF                      @ "a"
+str_e:     .byte 29, 0xFF                      @ "e"
+str_ta:    .byte 24, 28, 0xFF                  @ "Ta"
+str_te:    .byte 24, 29, 0xFF                  @ "Te"
+str_wrp:   .byte 26, 22, 21, 0xFF              @ "WRP"
+str_mis:   .byte 18, 16, 23, 0xFF              @ "MIS"
+str_view:  .byte 25, 16, 14, 26, 0xFF          @ "VIEW"
+str_pln:   .byte 21, 17, 19, 0xFF              @ "PLN"
+str_eci:   .byte 14, 12, 16, 0xFF              @ "ECI"
+str_ric:   .byte 22, 16, 12, 0xFF              @ "RIC"
+str_deny:  .byte 13, 14, 19, 27, 0xFF          @ "DENY"
+str_dgrd:  .byte 13, 15, 22, 13, 0xFF          @ "DGRD"
+str_dsrp:  .byte 13, 23, 22, 21, 0xFF          @ "DSRP"
+str_dstr:  .byte 13, 23, 24, 22, 0xFF          @ "DSTR"
+str_decv:  .byte 13, 14, 12, 25, 0xFF          @ "DECV"
+str_score: .byte 23, 12, 20, 22, 14, 0xFF      @ "SCORE"
+
+@ Mission name pointer table, indexed by mission_id.
+        .align 2
+mission_names:
+        .word   str_deny
+        .word   str_dgrd
+        .word   str_dsrp
+        .word   str_dstr
+        .word   str_decv
 
         .ltorg

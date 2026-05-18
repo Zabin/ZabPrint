@@ -128,19 +128,62 @@ def test_rom_element_cache_populated(rom_bytes):
     assert e_player_q16 < 0x4000, f"player e should be small; got 0x{e_player_q16:08X}"
 
 
-def test_rom_hud_a_bar_drawn(rom_bytes):
-    """At y=3 (row 3), the player's a bar should paint cyan pixels (0x7FE0)
-    starting at x=2 for a non-zero length. The clear loop spans most of each
-    frame, so we poll over several windows to catch the post-render state."""
+def test_rom_hud_dv_label_drawn(rom_bytes):
+    """The 'D' glyph of the 'DV' label is painted at (2, 2). Its first row
+    bitmap is 0b1110 -> pixels at (2,2), (3,2), (4,2) get the white label
+    colour (0x7FFF). Poll for a post-render frame."""
     cpu = _make_cpu(rom_bytes)
-    pixel_addr = VRAM_BASE + ((3 * 240 + 2) * 2)
+    addr = VRAM_BASE + ((2 * 240 + 2) * 2)
+    seen = False
+    for _ in range(20):
+        cpu.run_for(50_000)
+        if cpu.read_u16(addr) == 0x7FFF:
+            seen = True
+            break
+    assert seen, "DV label's leftmost pixel never observed white"
+
+
+def test_rom_hud_view_label_eci_vs_ric(rom_bytes):
+    """In ECI (default), the VIEW value paints 'ECI' starting at x=125, y=44
+    in white. The 'E' glyph row 0 = 0b1111 -> pixel (125, 44) is white."""
+    cpu = _make_cpu(rom_bytes)
+    addr = VRAM_BASE + ((44 * 240 + 125) * 2)
+    seen_white = False
+    for _ in range(20):
+        cpu.run_for(50_000)
+        if cpu.read_u16(addr) == 0x7FFF:
+            seen_white = True
+            break
+    assert seen_white, "ECI 'E' glyph never observed white at (125, 44)"
+
+
+def test_rom_hud_score_label_renders(rom_bytes):
+    """The 'S' glyph at (2, 145) is the leftmost of the SCORE label. S row 0
+    = 0b0111 -> pixels (3,145), (4,145), (5,145) are green (0x03E0)."""
+    cpu = _make_cpu(rom_bytes)
+    addr = VRAM_BASE + ((145 * 240 + 3) * 2)
+    seen = False
+    for _ in range(20):
+        cpu.run_for(50_000)
+        if cpu.read_u16(addr) == 0x03E0:
+            seen = True
+            break
+    assert seen, "SCORE label's S glyph never observed green"
+
+
+def test_rom_hud_a_bar_drawn(rom_bytes):
+    """The labeled HUD (Layer 8e) puts the player a bar at y=12 starting
+    at x=20. With boot orbit r=40, the bar paints ~40 cyan pixels. Poll
+    across sample windows because the clear loop dominates each frame."""
+    cpu = _make_cpu(rom_bytes)
+    pixel_addr = VRAM_BASE + ((12 * 240 + 20) * 2)
     seen_cyan = False
     for _ in range(20):
         cpu.run_for(50_000)
         if cpu.read_u16(pixel_addr) == 0x7FE0:
             seen_cyan = True
             break
-    assert seen_cyan, "HUD a-bar pixel never observed cyan across 20 samples"
+    assert seen_cyan, "HUD a-bar pixel at (20, 12) never observed cyan"
 
 
 def test_rom_orbital_motion_advances_targets(rom_bytes):
