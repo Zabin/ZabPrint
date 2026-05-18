@@ -45,6 +45,8 @@
         .equ S_T0,        0x20
         .equ S_T1,        0x30
         .equ S_T2,        0x40
+        .equ S_PLAYER_EL, 0x50          @ player elements  { a, e, omega, nu } Q16
+        .equ S_TARGET_EL, 0x60          @ target 0 elements (cached for HUD)
 
         @ Tuning: planet at screen centre, MU sized for ~4-second orbits at
         @ radius 40 pixels. These match the defaults in physics.s.
@@ -62,10 +64,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (20 words).
+        @ Zero the state block (28 words: 80 B state + 32 B element cache).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #20
+        mov     r2, #28
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -136,6 +138,16 @@ wait_start_vblank:
         ldr     r0, =STATE
         add     r0, r0, #S_T2
         bl      cowell_step
+
+        @ -------- orbital elements: cache for HUD ---------------------
+        ldr     r12, =STATE
+        mov     r0, r12                 @ &player == STATE
+        add     r1, r12, #S_PLAYER_EL
+        bl      _compute_elem_for_body
+        ldr     r12, =STATE
+        add     r0, r12, #S_T0
+        add     r1, r12, #S_TARGET_EL
+        bl      _compute_elem_for_body
 
         @ -------- target collision: each target vs player -------------
         @ Player integer position
@@ -333,7 +345,129 @@ score_loop:
         bne     score_loop
 skip_score:
 
+        @ -------- element HUD bars -----------------------------------
+        @ Player a (cyan, y=3): length = a >> 16 (clamped 0..100)
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_PLAYER_EL]
+        bl      _hud_a_len_clamped
+        mov     r2, r0
+        mov     r0, #2
+        mov     r1, #3
+        ldr     r3, =0x7FE0                     @ cyan
+        bl      _draw_hbar
+        @ Player e (yellow, y=5): length = e >> 11 (clamped 0..40)
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER_EL + 4)]
+        bl      _hud_e_len_clamped
+        mov     r2, r0
+        mov     r0, #2
+        mov     r1, #5
+        ldr     r3, =0x03FF                     @ bright yellow
+        bl      _draw_hbar
+        @ Target 0 a (dim cyan, y=8)
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_TARGET_EL]
+        bl      _hud_a_len_clamped
+        mov     r2, r0
+        mov     r0, #2
+        mov     r1, #8
+        ldr     r3, =0x4310                     @ dim cyan
+        bl      _draw_hbar
+        @ Target 0 e (dim yellow, y=10)
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_TARGET_EL + 4)]
+        bl      _hud_e_len_clamped
+        mov     r2, r0
+        mov     r0, #2
+        mov     r1, #10
+        ldr     r3, =0x023F                     @ dim yellow
+        bl      _draw_hbar
+
         b       frame_loop
+
+@ ----------------------------------------------------------------------------
+@ _compute_elem_for_body(body_ptr, out_ptr) -- wraps elements_from_state
+@ by first subtracting PLANET position so the kernel sees primary at origin.
+@   r0 = ECI state pointer (4 Q16 words: x, y, vx, vy in screen coords)
+@   r1 = output pointer    (4 Q16 words: a, e, omega, nu)
+@ Uses 16 bytes of stack as the primary-centred staging buffer.
+@ ----------------------------------------------------------------------------
+_compute_elem_for_body:
+        push    {r4, lr}
+        mov     r4, r1                  @ save out ptr across the kernel call
+        sub     sp, sp, #16
+        @ x_primary = x_eci - PLANET_X
+        ldr     r2, =PLANET_X_Q16
+        ldr     r3, [r0]
+        sub     r3, r3, r2
+        str     r3, [sp, #0]
+        @ y_primary = y_eci - PLANET_Y
+        ldr     r2, =PLANET_Y_Q16
+        ldr     r3, [r0, #4]
+        sub     r3, r3, r2
+        str     r3, [sp, #4]
+        @ vx, vy unchanged
+        ldr     r3, [r0, #8]
+        str     r3, [sp, #8]
+        ldr     r3, [r0, #12]
+        str     r3, [sp, #12]
+        mov     r0, sp
+        mov     r1, r4
+        bl      elements_from_state
+        add     sp, sp, #16
+        pop     {r4, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _hud_a_len_clamped(a_q16) -- map semi-major axis to a 0..100 bar length.
+@ Special-cases the hyperbolic sentinel (INT32_MAX) -> 0 length.
+@ ----------------------------------------------------------------------------
+_hud_a_len_clamped:
+        @ hyperbolic sentinel?
+        mvn     r1, #0x80000000         @ r1 = 0x7FFFFFFF
+        cmp     r0, r1
+        moveq   r0, #0
+        bxeq    lr
+        mov     r0, r0, asr #16         @ a in pixels
+        cmp     r0, #0
+        movlt   r0, #0
+        cmp     r0, #100
+        movgt   r0, #100
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _hud_e_len_clamped(e_q16) -- map eccentricity to a 0..40 bar length.
+@ e is non-negative by construction; shift down so e=1 -> 32 px, cap at 40.
+@ ----------------------------------------------------------------------------
+_hud_e_len_clamped:
+        mov     r0, r0, asr #11
+        cmp     r0, #0
+        movlt   r0, #0
+        cmp     r0, #40
+        movgt   r0, #40
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _draw_hbar(x_start, y_row, length, color) -- horizontal pixel bar.
+@   r0 = x_start (int pixels), r1 = y_row (int), r2 = length, r3 = color
+@ No bounds checking; caller keeps inside [0, 240) x [0, 160).
+@ ----------------------------------------------------------------------------
+_draw_hbar:
+        cmp     r2, #0
+        bxle    lr
+        push    {r4, r5, lr}
+        mov     r4, #240
+        mul     r4, r1, r4
+        add     r4, r4, r0
+        ldr     r5, =VRAM
+        add     r4, r5, r4, lsl #1
+hbar_loop:
+        strh    r3, [r4]
+        add     r4, r4, #2
+        subs    r2, r2, #1
+        bgt     hbar_loop
+        pop     {r4, r5, lr}
+        bx      lr
 
 @ ----------------------------------------------------------------------------
 @ _copy_orbit_body -- copy 16 bytes (1 body's worth) from r0 -> r1, advancing

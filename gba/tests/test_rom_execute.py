@@ -112,6 +112,33 @@ def test_rom_score_starts_at_zero(rom_bytes):
     assert cpu.read_u32(IWRAM_BASE + 0x14) == 0
 
 
+def test_rom_element_cache_populated(rom_bytes):
+    """After at least one frame, the element cache at S_PLAYER_EL (0x50) and
+    S_TARGET_EL (0x60) should hold finite element values (a near orbital
+    radius, e near zero for nearly-circular initial states)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    # Player boots at r=40, v=v_circ -> a ~ 40 in Q16 (= 40 << 16).
+    a_player_q16 = _s32(cpu.read_u32(IWRAM_BASE + 0x50))
+    # Allow ±8 px wobble from symplectic-Euler precession.
+    assert (32 << 16) <= a_player_q16 <= (48 << 16), \
+        f"player a should be near 40 Q16; got 0x{a_player_q16:08X}"
+    e_player_q16 = cpu.read_u32(IWRAM_BASE + 0x54)
+    # Circular -> e near zero. Allow up to 0.25 (Q16: 0x4000).
+    assert e_player_q16 < 0x4000, f"player e should be small; got 0x{e_player_q16:08X}"
+
+
+def test_rom_hud_a_bar_drawn(rom_bytes):
+    """At y=3 (row 3), the player's a bar should paint cyan pixels (0x7FE0)
+    starting at x=2 for a non-zero length."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    # Pixel at (2, 3) should be cyan (within rendered bar).
+    pixel_addr = VRAM_BASE + ((3 * 240 + 2) * 2)
+    assert cpu.read_u16(pixel_addr) == 0x7FE0, \
+        f"expected cyan HUD a-bar pixel at (2, 3); got 0x{cpu.read_u16(pixel_addr):04X}"
+
+
 def test_rom_orbital_motion_advances_targets(rom_bytes):
     """After ~3 frames the targets have moved off their initial positions due
     to orbital integration. (Player too, but D-pad-free.)"""
