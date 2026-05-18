@@ -243,3 +243,162 @@ _cs_skip_grav:
 
         pop     {r4-r11, lr}
         bx      lr
+
+@ ----------------------------------------------------------------------------
+@ elements_from_state(state_ptr, out_ptr) -- classical orbital elements.
+@
+@   state_ptr -> [ x_q16, y_q16, vx_q16, vy_q16 ]  (primary at origin)
+@   out_ptr   -> [ a_q16, e_q16, omega_brad, nu_brad ]  (16 bytes)
+@
+@ 2D Keplerian elements derived from a state vector with the primary at the
+@ origin. Uses MU_Q16 (default in this file; override-able by callers via
+@ later `.equ`):
+@
+@   r     = sqrt(x*x + y*y)
+@   v2    = vx*vx + vy*vy
+@   eps   = v2/2 - mu/r                          (specific energy)
+@   a     = -mu / (2 eps)                        (= INT32_MAX if eps >= 0)
+@   rdv   = x*vx + y*vy                          (radial momentum scalar)
+@   e_x   = (v2*x - rdv*vx)/mu - x/r             (eccentricity-vector x)
+@   e_y   = (v2*y - rdv*vy)/mu - y/r
+@   e     = sqrt(e_x*e_x + e_y*e_y)
+@   omega = atan2(e_y, e_x)                      (0 if e == 0)
+@   nu    = (atan2(y, x) - omega) & 0xFFFF
+@
+@ Output values are NOT masked to 16 bits for omega/nu; the low 16 are
+@ the canonical brad value, the high bits are ignored by callers.
+@
+@ Bit-identical to `_elements_from_state_py` in tests/test_physics_asm.py
+@ across +/- 100 px of the primary.
+@ ----------------------------------------------------------------------------
+elements_from_state:
+        push    {r4-r11, lr}
+        mov     r4, r0                  @ r4 = state ptr (preserved)
+        mov     r5, r1                  @ r5 = out ptr   (preserved)
+
+        @ === Stage 1: r = sqrt(x*x + y*y) =============================
+        ldr     r0, [r4]
+        mov     r1, r0
+        bl      fx_mul_q16              @ x*x
+        mov     r6, r0
+        ldr     r0, [r4, #4]
+        mov     r1, r0
+        bl      fx_mul_q16              @ y*y
+        add     r6, r6, r0              @ r6 = r2
+
+        mov     r0, r6
+        bl      fx_sqrt_q16
+        mov     r7, r0                  @ r7 = r (preserved across stages)
+
+        @ === Stage 2: v2 = vx*vx + vy*vy ==============================
+        ldr     r0, [r4, #8]
+        mov     r1, r0
+        bl      fx_mul_q16              @ vx*vx
+        mov     r8, r0
+        ldr     r0, [r4, #12]
+        mov     r1, r0
+        bl      fx_mul_q16              @ vy*vy
+        add     r8, r8, r0              @ r8 = v2 (preserved across stages)
+
+        @ === Stage 3: eps = v2/2 - mu/r ; then a ======================
+        ldr     r0, =MU_Q16
+        mov     r1, r7
+        bl      fx_div_q16              @ mu/r
+        mov     r9, r8, asr #1          @ v2/2 (v2 is non-negative)
+        sub     r9, r9, r0              @ r9 = eps
+
+        cmp     r9, #0
+        blt     _ef_bound
+        mvn     r0, #0x80000000         @ INT32_MAX sentinel for a
+        str     r0, [r5]
+        b       _ef_after_a
+_ef_bound:
+        ldr     r0, =MU_Q16
+        rsb     r0, r0, #0              @ -mu
+        mov     r1, r9, lsl #1          @ 2*eps  (eps was negative; result still 32-bit)
+        bl      fx_div_q16
+        str     r0, [r5]
+_ef_after_a:
+
+        @ === Stage 4: rdv = x*vx + y*vy ===============================
+        ldr     r0, [r4]
+        ldr     r1, [r4, #8]
+        bl      fx_mul_q16              @ x*vx
+        mov     r9, r0
+        ldr     r0, [r4, #4]
+        ldr     r1, [r4, #12]
+        bl      fx_mul_q16              @ y*vy
+        add     r9, r9, r0              @ r9 = rdv
+
+        @ === Stage 5: e_x = (v2*x - rdv*vx)/mu - x/r =================
+        mov     r0, r8
+        ldr     r1, [r4]
+        bl      fx_mul_q16              @ v2*x
+        mov     r10, r0
+        mov     r0, r9
+        ldr     r1, [r4, #8]
+        bl      fx_mul_q16              @ rdv*vx
+        sub     r10, r10, r0            @ num_x = v2*x - rdv*vx
+
+        mov     r0, r10
+        ldr     r1, =MU_Q16
+        bl      fx_div_q16              @ num_x / mu
+        mov     r11, r0                 @ partial e_x
+        ldr     r0, [r4]
+        mov     r1, r7
+        bl      fx_div_q16              @ x / r
+        sub     r11, r11, r0            @ r11 = e_x
+
+        @ === Stage 6: e_y = (v2*y - rdv*vy)/mu - y/r =================
+        mov     r0, r8
+        ldr     r1, [r4, #4]
+        bl      fx_mul_q16              @ v2*y
+        mov     r10, r0
+        mov     r0, r9
+        ldr     r1, [r4, #12]
+        bl      fx_mul_q16              @ rdv*vy
+        sub     r10, r10, r0            @ num_y
+
+        mov     r0, r10
+        ldr     r1, =MU_Q16
+        bl      fx_div_q16              @ num_y / mu
+        push    {r0}                    @ stash partial e_y (r10 needed next)
+        ldr     r0, [r4, #4]
+        mov     r1, r7
+        bl      fx_div_q16              @ y / r
+        pop     {r1}                    @ r1 = partial e_y
+        sub     r10, r1, r0             @ r10 = e_y
+
+        @ === Stage 7: e = sqrt(e_x^2 + e_y^2) ========================
+        mov     r0, r11
+        mov     r1, r11
+        bl      fx_mul_q16              @ e_x^2
+        mov     r6, r0
+        mov     r0, r10
+        mov     r1, r10
+        bl      fx_mul_q16              @ e_y^2
+        add     r6, r6, r0              @ e_sq
+        mov     r0, r6
+        bl      fx_sqrt_q16
+        str     r0, [r5, #4]            @ out.e
+
+        @ === Stage 8: omega = atan2(e_y, e_x) (0 if both zero) ========
+        orrs    r0, r10, r11
+        moveq   r0, #0
+        beq     _ef_omega_stored
+        mov     r0, r10
+        mov     r1, r11
+        bl      fx_atan2
+_ef_omega_stored:
+        str     r0, [r5, #8]            @ out.omega (low 16 bits matter)
+        mov     r6, r0                  @ save omega for nu
+
+        @ === Stage 9: nu = atan2(y, x) - omega ========================
+        ldr     r0, [r4, #4]
+        ldr     r1, [r4]
+        bl      fx_atan2
+        sub     r0, r0, r6
+        str     r0, [r5, #12]           @ out.nu (low 16 bits matter)
+
+        pop     {r4-r11, lr}
+        bx      lr

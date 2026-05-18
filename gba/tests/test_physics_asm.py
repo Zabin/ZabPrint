@@ -364,3 +364,155 @@ def test_cowell_step_circular_orbit_stays_bounded(cowell_blob):
     # Symplectic integrator bound: radius stays within +/- 20% of the start
     # over 200 steps at this resolution.
     assert 32 <= r_now <= 48, f"orbit radius drifted to {r_now} (initial 40)"
+
+
+# --- elements_from_state ------------------------------------------------
+#
+# Classical orbital elements from a 2D state vector. Primary at the ORIGIN
+# (the caller subtracts planet position before invoking). All inputs and
+# outputs in Q16.16. Outputs: a, e, omega (brad), nu (brad).
+#
+# Math (planar 2D, mu = MU_Q16):
+#   r       = sqrt(x*x + y*y)
+#   v2      = vx*vx + vy*vy
+#   eps     = v2/2 - mu/r                    (specific energy; negative bound)
+#   a       = -mu / (2*eps)                  (semi-major; sentinel if eps>=0)
+#   rdv     = x*vx + y*vy
+#   e_x     = (v2*x - rdv*vx)/mu - x/r       (eccentricity-vector x)
+#   e_y     = (v2*y - rdv*vy)/mu - y/r
+#   e       = sqrt(e_x^2 + e_y^2)
+#   omega   = atan2(e_y, e_x)                (arg of periapsis; 0 for e==0)
+#   nu      = (atan2(y, x) - omega) & 0xFFFF (true anomaly)
+
+# Sentinel for hyperbolic / parabolic orbits (eps >= 0): a written as INT32_MAX.
+_A_HYPERBOLIC = INT32_MAX
+
+
+def _elements_from_state_py(x, y, vx, vy, mu_q16=_MU_Q16):
+    """Pure-Python reference that composes the same Q16 primitives the ARM
+    kernel uses. Bit-identical to the ARM port within the same input envelope
+    that bounds cowell_step (+/- ~100 px from primary)."""
+    r2 = py_fx_mul_q16(x, x) + py_fx_mul_q16(y, y)
+    if r2 <= 0:
+        return _A_HYPERBOLIC, 0, 0, 0
+    r = py_fx_sqrt_q16(r2)
+    if r == 0:
+        return _A_HYPERBOLIC, 0, 0, 0
+
+    v2 = py_fx_mul_q16(vx, vx) + py_fx_mul_q16(vy, vy)
+    half_v2 = v2 >> 1                       # asr on negative not relevant; v2 >= 0
+    mu_over_r = py_fx_div_q16(mu_q16, r)
+    eps = half_v2 - mu_over_r
+
+    if eps >= 0:
+        a = _A_HYPERBOLIC
+    else:
+        two_eps = eps << 1                  # eps is negative, two_eps still 32-bit
+        a = py_fx_div_q16(-mu_q16, two_eps)
+
+    rdv = py_fx_mul_q16(x, vx) + py_fx_mul_q16(y, vy)
+
+    num_x = py_fx_mul_q16(v2, x) - py_fx_mul_q16(rdv, vx)
+    e_x   = py_fx_div_q16(num_x, mu_q16) - py_fx_div_q16(x, r)
+
+    num_y = py_fx_mul_q16(v2, y) - py_fx_mul_q16(rdv, vy)
+    e_y   = py_fx_div_q16(num_y, mu_q16) - py_fx_div_q16(y, r)
+
+    e_sq  = py_fx_mul_q16(e_x, e_x) + py_fx_mul_q16(e_y, e_y)
+    e     = py_fx_sqrt_q16(e_sq) if e_sq > 0 else 0
+
+    if e_x == 0 and e_y == 0:
+        omega = 0
+    else:
+        omega = py_fx_atan2(e_y, e_x)
+
+    nu = (py_fx_atan2(y, x) - omega) & 0xFFFF
+
+    return a, e, omega, nu
+
+
+def _arm_elements(blob, x, y, vx, vy):
+    cpu = ArmCpu()
+    cpu.load_code(blob.bytes_, at=_BASE)
+    state_addr = 0x1000
+    out_addr   = 0x1010
+    cpu.write_u32(state_addr,      x  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 4,  y  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 8,  vx & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 12, vy & 0xFFFFFFFF)
+    cpu.set_reg(0, state_addr)
+    cpu.set_reg(1, out_addr)
+    cpu.set_reg(13, 0x10000)
+    cpu.call(blob.symbols["elements_from_state"])
+    return (
+        _signed(cpu.read_u32(out_addr)),         # a (signed Q16)
+        _signed(cpu.read_u32(out_addr + 4)),     # e (signed Q16; always >= 0 in practice)
+        cpu.read_u32(out_addr + 8) & 0xFFFF,     # omega (brad; low 16 bits)
+        cpu.read_u32(out_addr + 12) & 0xFFFF,    # nu (brad)
+    )
+
+
+def _q16(x_real: float) -> int:
+    return int(round(x_real * (1 << 16)))
+
+
+def test_elements_circular_orbit_e_is_zero(cowell_blob):
+    """Perfect circular orbit at r=40 with v=v_circ. e should be 0 (or sub-LSB)."""
+    import math
+    r_int = 40
+    v_circ = math.sqrt(30.0 / r_int)
+    x  = r_int << 16
+    y  = 0
+    vx = 0
+    vy = _q16(v_circ)
+    a, e, omega, nu = _arm_elements(cowell_blob, x, y, vx, vy)
+    ref = _elements_from_state_py(x, y, vx, vy)
+    assert (a, e, omega, nu) == ref
+    # Sanity: e should round to near zero, a should be close to r in Q16.
+    assert e < 0x300            # <0.012 real; rounding noise only
+    assert abs(a - (r_int << 16)) < 0x4000   # within ~0.25 px
+
+
+def test_elements_radial_state_high_eccentricity(cowell_blob):
+    """A purely radial velocity (no angular momentum) is a degenerate
+    rectilinear orbit; e should be ~1."""
+    x, y = 40 << 16, 0
+    vx, vy = _q16(0.2), 0
+    a, e, omega, nu = _arm_elements(cowell_blob, x, y, vx, vy)
+    ref = _elements_from_state_py(x, y, vx, vy)
+    assert (a, e, omega, nu) == ref
+    assert e >= 0xC000           # e > 0.75
+
+
+def test_elements_hyperbolic_sentinel(cowell_blob):
+    """v^2 > 2*mu/r -> unbound; a written as INT32_MAX."""
+    # At r=40, escape v = sqrt(2*30/40) = 1.224. Use v = 2.0 -> well above.
+    x, y = 40 << 16, 0
+    vx, vy = 0, _q16(2.0)
+    a, e, omega, nu = _arm_elements(cowell_blob, x, y, vx, vy)
+    ref = _elements_from_state_py(x, y, vx, vy)
+    assert (a, e, omega, nu) == ref
+    assert a == _A_HYPERBOLIC
+
+
+def test_elements_bit_identity_fuzz(cowell_blob):
+    """Fuzz over the same envelope cowell_step uses (+/- 100 px from primary,
+    velocities up to 1 px/frame). Each (a, e, omega, nu) must match the
+    Python reference exactly."""
+    rng = random.Random(0xE1E1)
+    for _ in range(200):
+        x  = rng.randint(-100, 100) * (1 << 16)
+        y  = rng.randint(-100, 100) * (1 << 16)
+        if x == 0 and y == 0:
+            x = 1 << 16
+        # Velocities bounded so most cases stay sub-escape.
+        vx = rng.randint(-(1 << 16), 1 << 16)
+        vy = rng.randint(-(1 << 16), 1 << 16)
+        out = _arm_elements(cowell_blob, x, y, vx, vy)
+        ref = _elements_from_state_py(x, y, vx, vy)
+        assert out == ref, (
+            f"elements mismatch:\n"
+            f"  in={hex(x), hex(y), hex(vx), hex(vy)}\n"
+            f"  arm={tuple(hex(v) for v in out)}\n"
+            f"  ref={tuple(hex(v) for v in ref)}"
+        )
