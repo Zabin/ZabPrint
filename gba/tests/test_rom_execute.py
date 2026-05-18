@@ -153,14 +153,41 @@ def test_rom_orbital_motion_advances_targets(rom_bytes):
     assert t0_y > 80 << 16, f"target 0 y should be > 80<<16; got 0x{t0_y:08X}"
 
 
-def test_rom_thrust_changes_player_velocity(rom_bytes):
-    """Hold Right -> player vx grows above its circular-orbit value."""
-    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x10)
+def test_rom_dv_inits_at_max(rom_bytes):
+    """ship_dv at IWRAM 0x1C should boot to DV_MAX = 100 (Q16)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(1500)
+    assert cpu.read_u32(IWRAM_BASE + 0x1C) == 0x00640000
+
+
+def test_rom_prograde_burn_drains_dv(rom_bytes):
+    """Holding Up triggers exactly one edge-detected prograde burn on the
+    first frame; ship_dv decrements by one THRUST_COST unit (1<<16)."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x40)
     cpu.run_for(400_000)
+    dv = cpu.read_u32(IWRAM_BASE + 0x1C)
+    # Multi-frame run: edge-detect means only ONE burn (first frame). After
+    # that prev_keys == current_keys so bic returns 0 for the Up bit.
+    assert dv == 0x00640000 - 0x00010000, \
+        f"one burn should drop ship_dv by THRUST_COST; got 0x{dv:08X}"
+
+
+def test_rom_prograde_burn_grows_speed(rom_bytes):
+    """Prograde adds +BURN_DV along the unit v-vector. At boot v = (v_circ, 0),
+    so prograde changes vx by +BURN_DV exactly. Orbital motion then evolves
+    state, but |v| after one burn should remain strictly above the pre-burn
+    circular-orbit |v|."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x40)
+    # Need enough cycles for: init -> first frame's vsync polls -> input
+    # read -> burn dispatch -> cowell_step on 4 bodies -> clear loop. The
+    # clear loop alone is ~38k instructions.
+    cpu.run_for(80_000)
     vx = _s32(cpu.read_u32(IWRAM_BASE + 0x08))
-    # Boot value is 56756. With Right held, multiple frames of THRUST=0x2000
-    # accumulate, plus orbital effects. Net should be > boot value.
-    assert vx > 56756, f"holding Right should grow vx beyond circular; got 0x{vx:08X}"
+    # Boot circular speed magnitude ~ 56756. After one prograde burn,
+    # vx grew by +BURN_DV = 0x4000 in the burn block, then cowell_step
+    # added the gravity kick (vy received a small negative bump, vx a
+    # tiny one). |v| should be strictly above the boot circular value.
+    assert vx > 56756, f"prograde should grow vx; got 0x{vx:08X}"
 
 
 def test_rom_player_stays_bounded_under_orbit(rom_bytes):

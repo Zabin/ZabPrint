@@ -42,6 +42,7 @@
         .equ S_PREV,      0x10
         .equ S_SCORE,     0x14
         .equ S_FRAME,     0x18
+        .equ S_SHIP_DV,   0x1C
         .equ S_T0,        0x20
         .equ S_T1,        0x30
         .equ S_T2,        0x40
@@ -56,7 +57,11 @@
         .equ PLANET_Y_Q16, 0x00500000
         .equ MU_Q16,       0x001E0000
 
-        .equ THRUST,      0x2000          @ 0.125 in Q16 -- subtle nudges
+        .equ THRUST,      0x2000          @ legacy ΔV-free thrust (kept for now)
+        .equ BURN_DV,     0x4000          @ 0.25 in Q16; magnitude of every burn impulse
+        .equ DV_MAX,      0x00640000      @ 100 in Q16 -- starting ΔV tank
+        .equ THRUST_COST, 0x00010000      @ 1 unit per impulse (Q16)
+        .equ MIN_V_FOR_PROGRADE, 0x100    @ avoid div-by-near-zero when |v| ~ 0
 
 _start:
         ldr     sp, =0x03007F00
@@ -86,6 +91,11 @@ init_z:
         bl      _copy_orbit_body
         bl      _copy_orbit_body
 
+        @ Initialise ship_dv = DV_MAX.
+        ldr     r0, =STATE
+        ldr     r1, =DV_MAX
+        str     r1, [r0, #S_SHIP_DV]
+
 frame_loop:
         @ -------- vsync -----------------------------------------------
         ldr     r3, =VCOUNT
@@ -110,21 +120,141 @@ wait_start_vblank:
         mvn     r0, r0
         ldr     r1, [r12, #S_PREV]
         str     r0, [r12, #S_PREV]
+        bic     r1, r0, r1                      @ r1 = newly pressed (current AND NOT prev)
 
-        @ -------- D-pad thrust on player ------------------------------
-        ldr     r4, [r12, #(S_PLAYER + 8)]      @ vx
-        ldr     r5, [r12, #(S_PLAYER + 12)]     @ vy
-        ldr     r6, =THRUST
-        tst     r0, #0x10                       @ Right
-        addne   r4, r4, r6
-        tst     r0, #0x20                       @ Left
-        subne   r4, r4, r6
-        tst     r0, #0x40                       @ Up
-        subne   r5, r5, r6
-        tst     r0, #0x80                       @ Down
-        addne   r5, r5, r6
-        str     r4, [r12, #(S_PLAYER + 8)]
-        str     r5, [r12, #(S_PLAYER + 12)]
+        @ -------- D-pad orbital burns (edge-detected, ΔV-costed) -------
+        @ Up    = prograde,   Down  = retrograde   (along  v unit vector)
+        @ Right = radial-out, Left  = radial-in    (along  r unit vector)
+        @ Each impulse adds BURN_DV * unit-vector to velocity and costs
+        @ THRUST_COST from ship_dv. Skip everything if no D-pad press or
+        @ DV exhausted.
+        tst     r1, #0xF0
+        beq     burns_done
+        ldr     r2, [r12, #S_SHIP_DV]
+        cmp     r2, #0
+        ble     burns_done
+
+        mov     r4, r1                          @ stash newly-pressed mask
+
+        @ Compute |v|.
+        ldr     r0, [r12, #(S_PLAYER + 8)]
+        mov     r1, r0
+        bl      fx_mul_q16
+        mov     r5, r0
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER + 12)]
+        mov     r1, r0
+        bl      fx_mul_q16
+        add     r5, r5, r0
+        mov     r0, r5
+        bl      fx_sqrt_q16
+        mov     r5, r0                          @ r5 = |v|
+
+        @ Compute rx, ry, |r| (primary-centred).
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_PLAYER]
+        ldr     r1, =PLANET_X_Q16
+        sub     r6, r0, r1                      @ r6 = rx
+        ldr     r0, [r12, #(S_PLAYER + 4)]
+        ldr     r1, =PLANET_Y_Q16
+        sub     r7, r0, r1                      @ r7 = ry
+        mov     r0, r6
+        mov     r1, r6
+        bl      fx_mul_q16
+        mov     r8, r0
+        mov     r0, r7
+        mov     r1, r7
+        bl      fx_mul_q16
+        add     r8, r8, r0
+        mov     r0, r8
+        bl      fx_sqrt_q16
+        mov     r8, r0                          @ r8 = |r|
+
+        @ ---- Up: prograde -- impulse = +BURN_DV * (vx, vy)/|v|
+        tst     r4, #0x40
+        beq     skip_up
+        cmp     r5, #MIN_V_FOR_PROGRADE
+        ble     skip_up
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER + 8)]
+        mov     r1, r5
+        bl      fx_div_q16                      @ vx/|v|
+        ldr     r1, =BURN_DV
+        bl      fx_mul_q16                      @ dvx
+        mov     r9, r0
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER + 12)]
+        mov     r1, r5
+        bl      fx_div_q16
+        ldr     r1, =BURN_DV
+        bl      fx_mul_q16                      @ dvy
+        mov     r1, r0
+        mov     r0, r9
+        bl      _apply_burn
+skip_up:
+
+        @ ---- Down: retrograde
+        tst     r4, #0x80
+        beq     skip_down
+        cmp     r5, #MIN_V_FOR_PROGRADE
+        ble     skip_down
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER + 8)]
+        mov     r1, r5
+        bl      fx_div_q16
+        ldr     r1, =BURN_DV
+        bl      fx_mul_q16
+        rsb     r9, r0, #0                      @ -dvx
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER + 12)]
+        mov     r1, r5
+        bl      fx_div_q16
+        ldr     r1, =BURN_DV
+        bl      fx_mul_q16
+        rsb     r1, r0, #0                      @ -dvy
+        mov     r0, r9
+        bl      _apply_burn
+skip_down:
+
+        @ ---- Right: radial-out -- impulse = +BURN_DV * (rx, ry)/|r|
+        tst     r4, #0x10
+        beq     skip_right
+        mov     r0, r6
+        mov     r1, r8
+        bl      fx_div_q16
+        ldr     r1, =BURN_DV
+        bl      fx_mul_q16
+        mov     r9, r0
+        mov     r0, r7
+        mov     r1, r8
+        bl      fx_div_q16
+        ldr     r1, =BURN_DV
+        bl      fx_mul_q16
+        mov     r1, r0
+        mov     r0, r9
+        bl      _apply_burn
+skip_right:
+
+        @ ---- Left: radial-in
+        tst     r4, #0x20
+        beq     skip_left
+        mov     r0, r6
+        mov     r1, r8
+        bl      fx_div_q16
+        ldr     r1, =BURN_DV
+        bl      fx_mul_q16
+        rsb     r9, r0, #0
+        mov     r0, r7
+        mov     r1, r8
+        bl      fx_div_q16
+        ldr     r1, =BURN_DV
+        bl      fx_mul_q16
+        rsb     r1, r0, #0
+        mov     r0, r9
+        bl      _apply_burn
+skip_left:
+
+burns_done:
 
         @ -------- Cowell step on each body ----------------------------
         ldr     r0, =STATE
@@ -384,6 +514,30 @@ skip_score:
         bl      _draw_hbar
 
         b       frame_loop
+
+@ ----------------------------------------------------------------------------
+@ _apply_burn(dvx, dvy) -- adds an impulse to the player's velocity and
+@ decrements ship_dv by THRUST_COST. Caller must have already verified
+@ ship_dv > 0; we floor at 0 here for safety against repeated calls in
+@ the same frame.
+@   r0 = dvx (Q16), r1 = dvy (Q16)
+@ Clobbers: r2, r3, r12 (caller-saved).
+@ ----------------------------------------------------------------------------
+_apply_burn:
+        ldr     r2, =STATE
+        ldr     r3, [r2, #(S_PLAYER + 8)]
+        add     r3, r3, r0
+        str     r3, [r2, #(S_PLAYER + 8)]
+        ldr     r3, [r2, #(S_PLAYER + 12)]
+        add     r3, r3, r1
+        str     r3, [r2, #(S_PLAYER + 12)]
+        ldr     r3, [r2, #S_SHIP_DV]
+        ldr     r12, =THRUST_COST
+        sub     r3, r3, r12
+        cmp     r3, #0
+        movlt   r3, #0
+        str     r3, [r2, #S_SHIP_DV]
+        bx      lr
 
 @ ----------------------------------------------------------------------------
 @ _compute_elem_for_body(body_ptr, out_ptr) -- wraps elements_from_state
