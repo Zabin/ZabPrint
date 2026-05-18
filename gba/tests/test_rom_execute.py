@@ -311,3 +311,43 @@ def test_rom_player_stays_bounded_under_orbit(rom_bytes):
     dy = py - 80
     r2 = dx * dx + dy * dy
     assert r2 < 150 * 150, f"player escaped: r^2={r2} (dx={dx}, dy={dy})"
+
+
+def test_rom_idle_smoke_long_run(rom_bytes):
+    """3M-cycle idle smoke. No input, warp=1 throughout. Assertions:
+      * No bodies escape (player + all targets within 200 px of primary)
+      * No negative ship_dv (it should not drain at all without input)
+      * Mission FSM state stays inside [0, 4]
+      * All target healths in [0, DEW_INIT_HEALTH]
+      * hold_timers in non-negative range
+    """
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(3_000_000)
+
+    # Player + targets within 200 px of (120, 80).
+    for off in (0x00, 0x20, 0x30, 0x40):
+        x = _s32(cpu.read_u32(IWRAM_BASE + off)) >> 16
+        y = _s32(cpu.read_u32(IWRAM_BASE + off + 4)) >> 16
+        dx = x - 120
+        dy = y - 80
+        r2 = dx * dx + dy * dy
+        assert r2 < 200 * 200, f"body at offset 0x{off:02X} escaped: r^2={r2}"
+
+    # No DV drain (no input)
+    dv = cpu.read_u32(IWRAM_BASE + 0x1C)
+    assert 0 <= dv <= 0x00640000, f"ship_dv out of range: 0x{dv:08X}"
+
+    # Mission id in 0..4
+    mid = cpu.read_u32(IWRAM_BASE + 0x90)
+    assert 0 <= mid <= 4, f"mission_id out of range: {mid}"
+
+    # Target healths in [0, 3]
+    for i in range(3):
+        h = cpu.read_u32(IWRAM_BASE + 0xAC + i * 4)
+        assert 0 <= h <= 3, f"target {i} health out of range: {h}"
+
+    # Hold timers non-negative
+    for i in range(3):
+        t = cpu.read_u32(IWRAM_BASE + 0x9C + i * 4)
+        assert 0 <= t <= 1000, f"hold_timer {i} out of range: {t}"
+

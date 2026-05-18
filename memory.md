@@ -1,14 +1,22 @@
 # memory.md — cross-session state for the GBA space game
 
-Last updated by Claude after the "Finish the game" pass.
+Last updated after Phase 8c orbital-realism pass (12-phase plan, 9 phases shipped).
 
 ## Current state of the world
 
 - Branch: `claude/gba-space-game-Xwd0A` (pushed to origin)
-- Tests: **319 passing** (`python -m pytest gba/tests/` is green)
-- ROM: `gba/build.py` produces `gba/build/game.gba` (2 MiB) that boots
-  cleanly in mGBA. Drift physics, A-button projectile, two shootable
-  planets that respawn at LCG positions, green-pixel score bar.
+- Tests: **344 passing** (`python -m pytest gba/tests/` is green)
+- ROM: `gba/build.py` produces `gba/build/game.gba` (2 MiB). Real Cowell
+  two-body physics around one primary; player + 3 targets orbit. D-pad
+  fires orbital-frame impulses (Right = +in-track, Left = -in-track,
+  Up = +radial, Down = -radial), each costing 1 ΔV unit from a 100-unit
+  tank. R/L cycle time-warp 1×/10×/100×. SELECT toggles ECI / RIC
+  views (RIC centres on target 0 with ZOOM=4). B fires omnidirectional
+  DEW (range 70 px, cooldown 30 fr, target dies at 3 hits). START
+  flips orbital plane (25 ΔV cost). Mission FSM cycles through the
+  five Ds (Deny/Degrade/Disrupt/Destroy/Deceive); Deny + Degrade
+  win conditions wired; Disrupt/Destroy/Deceive scaffolded but await
+  grapple + element-match plumbing.
 
 ## Layer ledger
 
@@ -23,11 +31,25 @@ Last updated by Claude after the "Finish the game" pass.
 | 7 — Audio (PSG tracker + 8-bit PCM) | done | `26bc374` + `286eb8c` |
 | 8a — ARMv4 interpreter + fx_mul_q16 | done | `57c39bb` |
 | 8b — fx_div_q16, fx_sqrt_q16, fx_atan2 | done | `07a948e` |
-| 8c — sin/cos LUT, Cowell step | **not started** | — |
+| 8c.0 — Cowell step (ARM) | done | `bb79d36` |
+| 8c.1 — Elements kernel (a, e, ω, ν) | done | `ea8213f` |
+| 8c.2 — Element HUD (player + target a/e bars) | done | `08c588f` |
+| 8c.3 — Directional burns + ΔV economy | done | `9853867` |
+| 8c.4 — Time warp (R/L cycle 1/10/100) | done | `a6e27fa` |
+| 8c.5 — RIC ↔ ECI frame toggle (SELECT) | done | `c900a20` |
+| 8c.6+7 — Mission FSM + hold-at-risk Deny | done | `a885fde` |
+| 8c.8 — DEW (B, omnidirectional, cooldown) | done | `89c864c` |
+| 8c.9 — Sensor-cone fog-of-war | **deferred** | — |
+| 8c.10 — Plane change (START, 25 ΔV) | done | `922ec84` |
+| 8c.10b — Control remap to in-track/radial | done | `291b0f5` |
+| 8c.11 — Debris persistence | **deferred** (needs grapple) | — |
+| 8c.12 — Polish + idle smoke | this commit | — |
+| Grapple weapon | **deferred** | — |
+| sin/cos LUT in ARM | **deferred** | — |
 | 9a — Minimal ROM (boots, splash) | done | `508ecad` |
 | 9b — D-pad ship + starfield + planets | done | `4b0bad5` |
-| 9c — Drift physics + projectile | done | `22ab75d` |
-| 9d — Shootable planets + score + respawn | done | `7fad1d9` |
+| 9c — Drift physics + projectile | done (later replaced) | `22ab75d` |
+| 9d — Shootable planets + score + respawn | done (later replaced) | `7fad1d9` |
 
 ## What's bit-identical to its Python reference
 
@@ -40,6 +62,8 @@ Last updated by Claude after the "Finish the game" pass.
 | `fx_sqrt_q16` | 5 goldens + ~320 inputs over full positive 32-bit |
 | `fx_atan2` | 5 cardinal goldens + ~210 random (y, x) pairs |
 | `udiv64` (internal) | 6 goldens |
+| `cowell_step` | 5 cases (circular, drift, fuzz of 150 random states, multi-step bound) |
+| `elements_from_state` | 4 cases (circular e≈0, radial e≈1, hyperbolic sentinel, 200-pair fuzz) |
 
 The interpreter (`toolchain/armsim.py`) covers every instruction
 `encode_arm.py` emits plus BIOS SWI 0x06 (Div), 0x0D (Sqrt), 0x09
@@ -61,18 +85,49 @@ The interpreter (`toolchain/armsim.py`) covers every instruction
 * Audio playback driver (`src/sound.s`).
 * Mission system, upgrades, grapple/DEW combat.
 
-## Game-state IWRAM map (current crt0.s)
+## Game-state IWRAM map (current crt0.s — Phase 8c)
 
 ```
-0x03000000  ship_x_q16     ship_y_q16     ship_vx_q16    ship_vy_q16
-0x03000010  prev_keys      proj_x_q16     proj_y_q16     proj_vx_q16
-0x03000020  proj_vy_q16    proj_active    p1_x (int)     p1_y (int)
-0x03000030  p1_alive       p2_x           p2_y           p2_alive
-0x03000040  frame_count    score
+0x000  player          { x_q16, y_q16, vx_q16, vy_q16 }    16 B (ECI)
+0x010  prev_keys                                            4 B
+0x014  score                                                4 B
+0x018  frame_count                                          4 B
+0x01C  ship_dv                                              4 B  (Q16; tank, 0..DV_MAX)
+0x020  target 0        { x, y, vx, vy }                    16 B (ECI Q16)
+0x030  target 1        { x, y, vx, vy }                    16 B
+0x040  target 2        { x, y, vx, vy }                    16 B
+0x050  player_elements { a, e, omega, nu }                 16 B (Q16)
+0x060  target0_elements (cached for HUD)                   16 B
+0x070  warp                                                 4 B  (1, 10, 100)
+0x074  view_mode                                            4 B  (0 = ECI, 1 = RIC)
+0x078  ric_target_x / ric_target_y                          8 B  (Q16)
+0x080  ric_R̂_x / ric_R̂_y                                  8 B  (Q16)
+0x088  ric_Î_x / ric_Î_y                                   8 B  (Q16)
+0x090  mission_id / mission_progress / mission_target      12 B
+0x09C  hold_timers[3]                                      12 B
+0x0A8  dew_cooldown                                         4 B
+0x0AC  target healths[3]                                   12 B
+0x0B8  player_plane                                         4 B
+0x0BC  target_planes[3]                                    12 B
+0x0C8  end                                                200 B = 50 W
 ```
 
-80 bytes / 20 words. `init_z` zero-fills the whole block on boot then
-seeds non-zero values (positions, alive flags).
+`init_z` zero-fills 50 words on boot; non-zero seeds (positions,
+ship_dv, warp=1, target healths=3, target planes 0/1/0) follow.
+
+## Control mapping (Phase 8c, user-locked)
+
+  D-pad burns (edge-detected, 1 ΔV each, BURN_DV = 1/16 px/frame):
+    Right  -> +in-track   (~prograde for circular orbits)
+    Left   -> -in-track   (~retrograde)
+    Up     -> +radial     (away from primary)
+    Down   -> -radial     (toward primary)
+  A      -> (reserved for grapple, not yet wired)
+  B      -> DEW: hits nearest in-range, same-plane target (range 70 px)
+  SELECT -> toggle ECI / RIC view
+  START  -> plane change (costs 25 ΔV)
+  R      -> warp up cycle (1 -> 10 -> 100 -> 1)
+  L      -> warp down cycle
 
 ## ROM layout
 
@@ -102,6 +157,15 @@ the hand-encoded entry branch and runs through `pack_rom()`.
 | ROM 9b | 317 | +4 ROM-execute (with multi-region armsim) |
 | ROM 9c | 318 | +1 A-button spawn test |
 | ROM 9d | 319 | +1 planet+score init test |
+| Layer 8c.0 (Cowell) | 325 | +5 cowell_step + 1 ROM test rewrites |
+| Layer 8c.1 (elements) | 329 | +4 elements_from_state goldens + fuzz |
+| Layer 8c.2 (HUD) | 331 | +2 element-cache + bar paint |
+| Layer 8c.3 (burns) | 333 | +2 ΔV + in-track burn |
+| Layer 8c.4 (warp) | 336 | +3 warp toggle + acceleration |
+| Layer 8c.5 (RIC) | 339 | +3 view toggle + RIC-centred paint |
+| Layer 8c.6+7 (mission FSM + hold) | 340 | +1 mission state init |
+| Layer 8c.8 (DEW) | 342 | +2 health init + B-press hit |
+| Layer 8c.10 (plane) | 344 | +2 plane init + START toggle |
 
 ## Assembler quirks to remember (also in CLAUDE.md)
 
