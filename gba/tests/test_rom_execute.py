@@ -175,6 +175,46 @@ def test_rom_start_toggles_plane_costs_dv(rom_bytes):
         f"plane change should cost 25 ΔV; ship_dv now 0x{dv:08X}"
 
 
+def test_rom_grapple_target_inits_to_minus_one(rom_bytes):
+    """S_GRAPPLE_TARGET at IWRAM 0xC8 boots to -1 (no active grapple)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(1500)
+    assert _s32(cpu.read_u32(IWRAM_BASE + 0xC8)) == -1
+
+
+def test_rom_grapple_acquires_nearest_same_plane_target(rom_bytes):
+    """Holding A acquires the nearest in-range same-plane target. Boot
+    distances don't put any target in range, so stage the player at (168, 80)
+    with zero velocity beside target 0 (170, 80), then hold A and let a few
+    frames run so the new keyinput is observed."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(50_000)   # past init copy + first vsync wait
+    cpu.write_u32(IWRAM_BASE + 0x00, 168 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04, 80 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)
+    cpu.write_u32(IWRAM_BASE + 0x0C, 0)
+    cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x01)
+    cpu.run_for(300_000)
+    g = _s32(cpu.read_u32(IWRAM_BASE + 0xC8))
+    assert g == 0, f"grapple should lock target 0; got {g}"
+
+
+def test_rom_grapple_releases_when_a_not_held(rom_bytes):
+    """A not held -> S_GRAPPLE_TARGET reset to -1 every frame."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(80_000)
+    assert _s32(cpu.read_u32(IWRAM_BASE + 0xC8)) == -1
+
+
+def test_rom_debris_slots_init_dead(rom_bytes):
+    """All 4 debris alive flags are 0 at boot."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(1500)
+    for i in range(4):
+        slot = IWRAM_BASE + 0xD0 + i * 32
+        assert cpu.read_u32(slot + 16) == 0, f"debris {i} should boot dead"
+
+
 def test_rom_dew_fires_on_b_press(rom_bytes):
     """Holding B for the first frame triggers a DEW shot at the nearest in-
     range target. Boot positions: player (120, 40), target 0 (170, 80) ->

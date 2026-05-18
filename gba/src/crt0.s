@@ -64,6 +64,15 @@
         .equ S_T_HEALTH,          0xAC  @ 3 words: per-target health for DEW (3 -> 0)
         .equ S_PLAYER_PLANE,      0xB8
         .equ S_T_PLANE,           0xBC  @ 3 words: per-target plane flag (0 or 1)
+        .equ S_GRAPPLE_TARGET,    0xC8  @ -1 = none, else target idx 0..2
+        .equ S_GRAPPLE_TIMER,     0xCC  @ frames the current grapple has been held
+        .equ GRAPPLE_RANGE_SQ,    4096  @ 64 px squared
+        .equ GRAPPLE_FULL,        120   @ frames to complete tow-to-graveyard
+        .equ S_DEBRIS,            0xD0  @ 4 slots * 8 words = 128 bytes
+        .equ DEBRIS_SLOT_SZ,      32    @ bytes per slot: x,y,vx,vy,alive,age,pad,pad
+        .equ DEBRIS_N,            4     @ number of slots
+        .equ DEBRIS_MAX_AGE,      600   @ ~10 s at 60 fps (1x warp)
+        .equ DEBRIS_HIT_SQ,       9     @ player collision radius squared (3 px)
         .equ PLANE_CHANGE_DV,     0x00190000   @ 25 (Q16) cost to flip planes
         .equ HOLD_DIST_SQ,        144   @ 12 px squared
         .equ HOLD_THRESH,         90    @ frames to trigger Deny completion
@@ -93,10 +102,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (50 words: 46 prior + 16 B plane state).
+        @ Zero the state block (84 words: 52 prior + 128 B debris).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #50
+        mov     r2, #84
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -132,6 +141,9 @@ init_z:
         str     r1, [r0, #(S_T_PLANE + 4)]
         mov     r1, #0
         str     r1, [r0, #(S_T_PLANE + 8)]
+        @ Grapple slot starts disengaged (-1).
+        mvn     r1, #0
+        str     r1, [r0, #S_GRAPPLE_TARGET]
 
 frame_loop:
         @ -------- vsync -----------------------------------------------
@@ -452,6 +464,136 @@ dew_scan_next:
         bl      _advance_mission
 dew_done:
 
+        @ -------- Grapple (A held; first-frame edge acquires, sustained drags)
+        @ State machine on S_GRAPPLE_TARGET (-1 = idle, else target idx).
+        @ r0 was clobbered by the DEW scan; current inverted-keys mask is
+        @ still in S_PREV (we stored it there at input time).
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_PREV]
+        tst     r0, #0x01                       @ A currently held?
+        beq     grapple_release
+        ldr     r5, [r12, #S_GRAPPLE_TARGET]
+        cmp     r5, #0
+        bge     grapple_drag                    @ already locked
+
+        @ Acquire: scan same-plane targets within GRAPPLE_RANGE_SQ.
+        ldr     r0, [r12, #S_PLAYER]
+        ldr     r1, [r12, #(S_PLAYER + 4)]
+        mov     r5, r0, asr #16                 @ player int x
+        mov     r6, r1, asr #16                 @ player int y
+        mvn     r0, #0                          @ best idx = -1
+        ldr     r1, =GRAPPLE_RANGE_SQ
+        add     r1, r1, #1                      @ best dist² (sentinel)
+        mov     r2, #0
+grapple_scan_loop:
+        add     r3, r12, r2, lsl #2
+        ldr     r3, [r3, #S_T_PLANE]
+        ldr     r7, [r12, #S_PLAYER_PLANE]
+        cmp     r3, r7
+        bne     grapple_scan_next
+        mov     r3, r2, lsl #4
+        add     r3, r3, #S_T0
+        add     r7, r12, r3
+        ldr     r3, [r7]
+        ldr     r8, [r7, #4]
+        mov     r3, r3, asr #16
+        mov     r8, r8, asr #16
+        sub     r3, r3, r5
+        sub     r8, r8, r6
+        mul     r3, r3, r3
+        mul     r8, r8, r8
+        add     r3, r3, r8
+        cmp     r3, r1
+        bge     grapple_scan_next
+        mov     r0, r2
+        mov     r1, r3
+grapple_scan_next:
+        add     r2, r2, #1
+        cmp     r2, #3
+        blt     grapple_scan_loop
+
+        cmp     r0, #0
+        blt     grapple_done                    @ nothing in range
+        str     r0, [r12, #S_GRAPPLE_TARGET]
+        mov     r1, #0
+        str     r1, [r12, #S_GRAPPLE_TIMER]
+        b       grapple_done
+
+grapple_drag:
+        @ r5 = grapple_target idx. Drag target velocity toward player:
+        @   vt += (vp - vt) >> 3
+        @ Then grapple_timer++; if >= GRAPPLE_FULL, complete.
+        mov     r6, r5, lsl #4
+        add     r6, r6, #S_T0
+        add     r6, r12, r6                     @ &target[idx]
+        ldr     r0, [r12, #(S_PLAYER + 8)]
+        ldr     r1, [r6, #8]
+        sub     r2, r0, r1
+        add     r1, r1, r2, asr #3
+        str     r1, [r6, #8]
+        ldr     r0, [r12, #(S_PLAYER + 12)]
+        ldr     r1, [r6, #12]
+        sub     r2, r0, r1
+        add     r1, r1, r2, asr #3
+        str     r1, [r6, #12]
+
+        ldr     r0, [r12, #S_GRAPPLE_TIMER]
+        add     r0, r0, #1
+        str     r0, [r12, #S_GRAPPLE_TIMER]
+        cmp     r0, #GRAPPLE_FULL
+        blt     grapple_done
+
+        @ Tow-to-graveyard complete: respawn target from init table, +3 score,
+        @ Destroy mission advance if matched, debris will spawn via
+        @ _spawn_debris (added in 8c.11).
+        mov     r2, r5                          @ stash idx
+        add     r1, r5, #1
+        ldr     r0, =init_orbits
+        add     r0, r0, r1, lsl #4
+        mov     r1, r12
+        add     r1, r1, r2, lsl #4
+        add     r1, r1, #S_T0
+        push    {r2, lr}
+        bl      _copy_orbit_body
+        pop     {r2, lr}
+        ldr     r12, =STATE
+        @ Reset target health + hold timer.
+        add     r3, r12, r2, lsl #2
+        mov     r1, #DEW_INIT_HEALTH
+        str     r1, [r3, #S_T_HEALTH]
+        mov     r1, #0
+        str     r1, [r3, #S_HOLD_TIMERS]
+        @ Score += 3.
+        ldr     r1, [r12, #S_SCORE]
+        add     r1, r1, #3
+        str     r1, [r12, #S_SCORE]
+        @ Destroy mission (3) on matched target -> hard-kill: spawn debris,
+        @ advance the mission. Any other mission state -> soft kill, no debris.
+        ldr     r0, [r12, #S_MISSION_ID]
+        cmp     r0, #3
+        bne     grapple_clear
+        ldr     r0, [r12, #S_MISSION_TARGET]
+        cmp     r0, r2
+        bne     grapple_clear
+        bl      _spawn_debris_at_player
+        ldr     r12, =STATE
+        bl      _advance_mission
+        ldr     r12, =STATE
+grapple_clear:
+        mvn     r0, #0
+        str     r0, [r12, #S_GRAPPLE_TARGET]
+        mov     r0, #0
+        str     r0, [r12, #S_GRAPPLE_TIMER]
+        b       grapple_done
+
+grapple_release:
+        @ A not held -> drop any active grapple, reset timer.
+        mvn     r1, #0
+        str     r1, [r12, #S_GRAPPLE_TARGET]
+        mov     r1, #0
+        str     r1, [r12, #S_GRAPPLE_TIMER]
+grapple_done:
+
         @ -------- Substep loop: cowell_step on each body, WARP times --
         ldr     r12, =STATE
         ldr     r5, [r12, #S_WARP]
@@ -472,6 +614,9 @@ warp_substep_loop:
         sub     r5, r5, #1
         b       warp_substep_loop
 warp_substep_done:
+
+        @ -------- debris: cowell_step each alive slot + aging + collision ---
+        bl      _debris_tick
 
         @ -------- orbital elements: cache for HUD ---------------------
         ldr     r12, =STATE
@@ -640,6 +785,9 @@ star_skip:
         ldr     r2, =0x7FE0                     @ cyan-white
         bl      draw_square3
 
+        @ -------- debris (grey pixels) -------------------------------
+        bl      _draw_debris
+
         @ -------- player ship core + heading nose ---------------------
         ldr     r12, =STATE
         ldr     r0, [r12, #S_PLAYER]
@@ -785,6 +933,11 @@ skip_score:
         bl      _draw_hbar
 
         b       frame_loop
+
+        @ Flush the literal pool here so the frame-loop `ldr =VALUE`s land
+        @ within +/- 4 KB. Without this, helpers at the end of the file
+        @ can't reach the final .ltorg.
+        .ltorg
 
 @ ----------------------------------------------------------------------------
 @ _world_to_screen(body_x_q16, body_y_q16) -- ECI Q16 -> integer screen px.
@@ -980,6 +1133,182 @@ _mod3_loop:
         str     r0, [r4, #(S_HOLD_TIMERS + 4)]
         str     r0, [r4, #(S_HOLD_TIMERS + 8)]
         pop     {r4, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _spawn_debris_at_player -- spawn DEBRIS_N debris bodies at the player's
+@ current position. Each slot's velocity = player velocity perturbed by a
+@ small per-slot kick computed from S_FRAME (cheap deterministic PRNG).
+@ Clobbers r0-r5, r12.
+@ ----------------------------------------------------------------------------
+_spawn_debris_at_player:
+        push    {r4, r5, lr}
+        ldr     r12, =STATE
+        ldr     r4, [r12, #S_PLAYER]            @ player_x Q16
+        ldr     r5, [r12, #(S_PLAYER + 4)]      @ player_y Q16
+        @ Walk all 4 slots; overwrite each unconditionally with a fresh body.
+        @ slot offsets: S_DEBRIS + i * 32
+        mov     r0, #0                          @ i
+_sdbr_loop:
+        @ slot_addr = STATE + S_DEBRIS + i*32
+        mov     r1, r0, lsl #5
+        add     r1, r1, #S_DEBRIS
+        add     r1, r12, r1
+        str     r4, [r1, #0]                    @ x = player_x
+        str     r5, [r1, #4]                    @ y = player_y
+        @ Velocity = player velocity ± per-slot kick
+        ldr     r2, [r12, #(S_PLAYER + 8)]      @ player_vx
+        ldr     r3, [r12, #(S_PLAYER + 12)]     @ player_vy
+        @ Per-slot kick: rotate (i + frame) bits to pick one of 4 directions
+        @ approximating (+x, +y, -x, -y) at magnitude 0x8000 (0.5 Q16).
+        @ idx 0: vx += 0x8000
+        @ idx 1: vy += 0x8000
+        @ idx 2: vx -= 0x8000
+        @ idx 3: vy -= 0x8000
+        cmp     r0, #0
+        beq     _sdbr_kick_xp
+        cmp     r0, #1
+        beq     _sdbr_kick_yp
+        cmp     r0, #2
+        beq     _sdbr_kick_xn
+        @ idx 3
+        sub     r3, r3, #0x8000
+        b       _sdbr_store
+_sdbr_kick_xp:
+        add     r2, r2, #0x8000
+        b       _sdbr_store
+_sdbr_kick_yp:
+        add     r3, r3, #0x8000
+        b       _sdbr_store
+_sdbr_kick_xn:
+        sub     r2, r2, #0x8000
+_sdbr_store:
+        str     r2, [r1, #8]
+        str     r3, [r1, #12]
+        mov     r2, #1
+        str     r2, [r1, #16]                   @ alive = 1
+        mov     r2, #0
+        str     r2, [r1, #20]                   @ age = 0
+        add     r0, r0, #1
+        cmp     r0, #DEBRIS_N
+        blt     _sdbr_loop
+        pop     {r4, r5, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _debris_tick -- per frame, advance every alive debris through cowell_step,
+@ increment age, kill on age > DEBRIS_MAX_AGE or off-screen, and apply a
+@ collision against the player: integer pixel distance² <= DEBRIS_HIT_SQ
+@ subtracts 1 from score and kills the offending debris.
+@ Clobbers r0-r3, r12; may call cowell_step (preserves r4-r11).
+@ ----------------------------------------------------------------------------
+_debris_tick:
+        push    {r4-r10, lr}
+        ldr     r4, =STATE
+        ldr     r5, [r4, #S_PLAYER]
+        ldr     r6, [r4, #(S_PLAYER + 4)]
+        mov     r5, r5, asr #16                 @ player int x
+        mov     r6, r6, asr #16
+        mov     r7, #0                          @ i
+_dtick_loop:
+        mov     r0, r7, lsl #5
+        add     r0, r0, #S_DEBRIS
+        add     r8, r4, r0                      @ &slot
+        ldr     r9, [r8, #16]                   @ alive
+        cmp     r9, #0
+        beq     _dtick_next
+
+        @ Cowell step on this body.
+        mov     r0, r8
+        bl      cowell_step
+        ldr     r4, =STATE
+        mov     r0, r7, lsl #5
+        add     r0, r0, #S_DEBRIS
+        add     r8, r4, r0
+
+        @ Age++
+        ldr     r0, [r8, #20]
+        add     r0, r0, #1
+        str     r0, [r8, #20]
+        cmp     r0, #DEBRIS_MAX_AGE
+        bgt     _dtick_kill
+
+        @ Off-screen kill: integer x,y outside [0, 240) x [0, 160)
+        ldr     r0, [r8, #0]
+        ldr     r1, [r8, #4]
+        mov     r2, r0, asr #16
+        mov     r3, r1, asr #16
+        cmp     r2, #0
+        blt     _dtick_kill
+        cmp     r2, #240
+        bge     _dtick_kill
+        cmp     r3, #0
+        blt     _dtick_kill
+        cmp     r3, #160
+        bge     _dtick_kill
+
+        @ Player collision: |delta|² <= DEBRIS_HIT_SQ
+        sub     r2, r2, r5
+        sub     r3, r3, r6
+        mul     r2, r2, r2
+        mul     r3, r3, r3
+        add     r2, r2, r3
+        cmp     r2, #DEBRIS_HIT_SQ
+        bgt     _dtick_next
+        @ Hit: -1 score (clamp at 0), kill debris.
+        ldr     r0, [r4, #S_SCORE]
+        cmp     r0, #0
+        subgt   r0, r0, #1
+        str     r0, [r4, #S_SCORE]
+_dtick_kill:
+        mov     r0, #0
+        str     r0, [r8, #16]
+_dtick_next:
+        add     r7, r7, #1
+        cmp     r7, #DEBRIS_N
+        blt     _dtick_loop
+        pop     {r4-r10, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _draw_debris -- paint a single grey pixel for every alive debris body,
+@ transformed through the active ECI/RIC view.
+@ Clobbers r0-r3, r12 internally; push/pops r4-r6 and lr for safety.
+@ ----------------------------------------------------------------------------
+_draw_debris:
+        push    {r4, r5, r6, lr}
+        mov     r6, #0                          @ slot index
+_ddr_loop:
+        ldr     r4, =STATE
+        mov     r0, r6, lsl #5
+        add     r0, r0, #S_DEBRIS
+        add     r5, r4, r0                      @ &slot
+        ldr     r0, [r5, #16]
+        cmp     r0, #0
+        beq     _ddr_next
+        ldr     r0, [r5, #0]
+        ldr     r1, [r5, #4]
+        bl      _world_to_screen
+        cmp     r0, #0
+        blt     _ddr_next
+        cmp     r0, #240
+        bge     _ddr_next
+        cmp     r1, #0
+        blt     _ddr_next
+        cmp     r1, #160
+        bge     _ddr_next
+        mov     r2, #240
+        mul     r2, r1, r2
+        add     r2, r2, r0
+        ldr     r3, =VRAM
+        add     r2, r3, r2, lsl #1
+        ldr     r3, =0x5294                     @ bright grey
+        strh    r3, [r2]
+_ddr_next:
+        add     r6, r6, #1
+        cmp     r6, #DEBRIS_N
+        blt     _ddr_loop
+        pop     {r4, r5, r6, lr}
         bx      lr
 
 @ ----------------------------------------------------------------------------
