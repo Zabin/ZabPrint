@@ -157,6 +157,32 @@ def test_rom_orbital_motion_advances_targets(rom_bytes):
     assert t0_y > 80 << 16, f"target 0 y should be > 80<<16; got 0x{t0_y:08X}"
 
 
+def test_rom_dew_fires_on_b_press(rom_bytes):
+    """Holding B for the first frame triggers a DEW shot at the nearest in-
+    range target. Boot positions: player (120, 40), target 0 (170, 80) ->
+    d^2 = 4100, target 1 (120, 110) -> d^2 = 4900, target 2 (60, 80) -> 5200.
+    DEW_RANGE_SQ = 4900, so targets 0 and 1 are in range but target 0 is
+    closer. After the shot dew_cooldown sets to 30; target 0's health
+    drops from 3 to 2; targets 1+2 are untouched."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x02)
+    cpu.run_for(80_000)
+    cd = cpu.read_u32(IWRAM_BASE + 0xA8)
+    assert cd >= 28, f"DEW should have fired (cooldown >= 28); got {cd}"
+    health0 = cpu.read_u32(IWRAM_BASE + 0xAC + 0)
+    assert health0 == 2, f"target 0 health should be 2 after one DEW hit; got {health0}"
+    health1 = cpu.read_u32(IWRAM_BASE + 0xAC + 4)
+    assert health1 == 3, f"target 1 untouched, should remain 3; got {health1}"
+
+
+def test_rom_dew_inits_healths_to_three(rom_bytes):
+    """All three targets start at DEW_INIT_HEALTH = 3."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(1500)
+    assert cpu.read_u32(IWRAM_BASE + 0xAC + 0) == 3
+    assert cpu.read_u32(IWRAM_BASE + 0xAC + 4) == 3
+    assert cpu.read_u32(IWRAM_BASE + 0xAC + 8) == 3
+
+
 def test_rom_mission_state_initialised(rom_bytes):
     """mission_id (0=Deny), mission_target (0), hold_timers all zero at boot."""
     cpu = _make_cpu(rom_bytes)

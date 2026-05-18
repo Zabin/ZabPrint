@@ -60,8 +60,13 @@
         .equ S_MISSION_PROGRESS,  0x94  @ frame counter or proxy
         .equ S_MISSION_TARGET,    0x98  @ index into targets[3]
         .equ S_HOLD_TIMERS,       0x9C  @ 3 words: per-target hold-at-risk frame counters
+        .equ S_DEW_COOLDOWN,      0xA8
+        .equ S_T_HEALTH,          0xAC  @ 3 words: per-target health for DEW (3 -> 0)
         .equ HOLD_DIST_SQ,        144   @ 12 px squared
         .equ HOLD_THRESH,         90    @ frames to trigger Deny completion
+        .equ DEW_RANGE_SQ,        4900  @ 70 px squared
+        .equ DEW_CD_FRAMES,       30
+        .equ DEW_INIT_HEALTH,     3
         .equ DV_REFILL_Q16,       0x00190000   @ 25 (Q16) refill on mission complete
         .equ RIC_ZOOM_SHIFT, 14         @ Q16 ΔR/ΔI -> screen px:  >> (16-2) = ×4 zoom
 
@@ -85,10 +90,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (42 words: 39 prior + 12 B hold_timers).
+        @ Zero the state block (46 words: 42 prior + DEW + per-target health).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #42
+        mov     r2, #46
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -107,12 +112,16 @@ init_z:
         bl      _copy_orbit_body
         bl      _copy_orbit_body
 
-        @ Initialise ship_dv = DV_MAX, warp = 1.
+        @ Initialise ship_dv = DV_MAX, warp = 1, target healths = DEW_INIT_HEALTH.
         ldr     r0, =STATE
         ldr     r1, =DV_MAX
         str     r1, [r0, #S_SHIP_DV]
         mov     r1, #1
         str     r1, [r0, #S_WARP]
+        mov     r1, #DEW_INIT_HEALTH
+        str     r1, [r0, #(S_T_HEALTH + 0)]
+        str     r1, [r0, #(S_T_HEALTH + 4)]
+        str     r1, [r0, #(S_T_HEALTH + 8)]
 
 frame_loop:
         @ -------- vsync -----------------------------------------------
@@ -311,6 +320,100 @@ no_warp_l:
         eor     r5, r5, #1
         str     r5, [r12, #S_VIEW_MODE]
 no_view_toggle:
+
+        @ -------- DEW (B button, edge-detected, cooldown-gated) -------
+        @ Decrement cooldown first; even if B isn't pressed.
+        ldr     r12, =STATE
+        ldr     r5, [r12, #S_DEW_COOLDOWN]
+        cmp     r5, #0
+        ble     dew_cd_done
+        sub     r5, r5, #1
+        str     r5, [r12, #S_DEW_COOLDOWN]
+dew_cd_done:
+        @ Fire if B newly-pressed AND cooldown clear.
+        tst     r4, #0x02
+        beq     dew_done
+        ldr     r5, [r12, #S_DEW_COOLDOWN]
+        cmp     r5, #0
+        bgt     dew_done
+
+        @ Find nearest target within DEW_RANGE_SQ.
+        ldr     r0, [r12, #S_PLAYER]
+        ldr     r1, [r12, #(S_PLAYER + 4)]
+        mov     r5, r0, asr #16                 @ player int x
+        mov     r6, r1, asr #16                 @ player int y
+        mvn     r0, #0                          @ best target idx (-1 = none)
+        ldr     r1, =DEW_RANGE_SQ
+        add     r1, r1, #1                      @ best dist² (just outside range)
+        mov     r2, #0                          @ iter i
+dew_scan_loop:
+        mov     r3, r2, lsl #4
+        add     r3, r3, #S_T0
+        add     r7, r12, r3
+        ldr     r3, [r7]
+        ldr     r8, [r7, #4]
+        mov     r3, r3, asr #16
+        mov     r8, r8, asr #16
+        sub     r3, r3, r5                      @ dx
+        sub     r8, r8, r6                      @ dy
+        mul     r3, r3, r3
+        mul     r8, r8, r8
+        add     r3, r3, r8
+        cmp     r3, r1
+        bge     dew_scan_next
+        mov     r0, r2                          @ best idx
+        mov     r1, r3                          @ best dist²
+dew_scan_next:
+        add     r2, r2, #1
+        cmp     r2, #3
+        blt     dew_scan_loop
+
+        cmp     r0, #0
+        blt     dew_done                        @ no target in range
+
+        @ Hit: health[idx] -= 1
+        ldr     r12, =STATE
+        add     r2, r12, r0, lsl #2             @ &health[idx]
+        ldr     r3, [r2, #S_T_HEALTH]
+        sub     r3, r3, #1
+        str     r3, [r2, #S_T_HEALTH]
+        @ Cooldown
+        mov     r5, #DEW_CD_FRAMES
+        str     r5, [r12, #S_DEW_COOLDOWN]
+
+        @ If health hits 0, respawn target + maybe advance Degrade mission.
+        cmp     r3, #0
+        bgt     dew_done
+
+        @ Respawn from init_orbits[1 + idx]
+        mov     r2, r0                          @ stash idx
+        add     r1, r2, #1                      @ body index (1, 2, 3)
+        ldr     r0, =init_orbits
+        add     r0, r0, r1, lsl #4
+        mov     r1, r12
+        add     r1, r1, r2, lsl #4
+        add     r1, r1, #S_T0
+        push    {r2, lr}
+        bl      _copy_orbit_body
+        pop     {r2, lr}
+        @ Reset that target's health to DEW_INIT_HEALTH
+        ldr     r12, =STATE
+        add     r3, r12, r2, lsl #2
+        mov     r5, #DEW_INIT_HEALTH
+        str     r5, [r3, #S_T_HEALTH]
+        @ Also clear that target's hold-timer
+        mov     r5, #0
+        str     r5, [r3, #S_HOLD_TIMERS]
+
+        @ Mission Degrade completion if matched
+        ldr     r0, [r12, #S_MISSION_ID]
+        cmp     r0, #1                          @ Degrade
+        bne     dew_done
+        ldr     r0, [r12, #S_MISSION_TARGET]
+        cmp     r0, r2
+        bne     dew_done
+        bl      _advance_mission
+dew_done:
 
         @ -------- Substep loop: cowell_step on each body, WARP times --
         ldr     r12, =STATE
