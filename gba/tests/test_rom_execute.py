@@ -175,6 +175,20 @@ def test_rom_start_toggles_plane_costs_dv(rom_bytes):
         f"plane change should cost 25 ΔV; ship_dv now 0x{dv:08X}"
 
 
+def test_rom_sensor_dir_cached_each_frame(rom_bytes):
+    """After at least one frame, S_SENSOR_DIR at IWRAM 0x150 holds
+    atan2(player_vy, player_vx). Boot velocity is (+v_circ, 0) so the
+    heading is 0 brad (positive-x axis)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(80_000)
+    sensor_dir = cpu.read_u32(IWRAM_BASE + 0x150) & 0xFFFF
+    # After a frame or two, gravity has nudged vy slightly positive (the body
+    # falls toward the primary), so heading drifts a few hundred brad off
+    # zero. Allow ±0x800 (≈ 11°) of slack.
+    in_range = sensor_dir <= 0x800 or sensor_dir >= (0x10000 - 0x800)
+    assert in_range, f"sensor_dir should be near 0 at boot; got 0x{sensor_dir:04X}"
+
+
 def test_rom_grapple_target_inits_to_minus_one(rom_bytes):
     """S_GRAPPLE_TARGET at IWRAM 0xC8 boots to -1 (no active grapple)."""
     cpu = _make_cpu(rom_bytes)

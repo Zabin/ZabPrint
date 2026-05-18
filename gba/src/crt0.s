@@ -73,6 +73,8 @@
         .equ DEBRIS_N,            4     @ number of slots
         .equ DEBRIS_MAX_AGE,      600   @ ~10 s at 60 fps (1x warp)
         .equ DEBRIS_HIT_SQ,       9     @ player collision radius squared (3 px)
+        .equ S_SENSOR_DIR,        0x150 @ cached fx_atan2(vy, vx) for the cone
+        .equ SENSOR_HALF_ANGLE,   0x2000 @ 45° in brad: ±45° = 90° total cone
         .equ PLANE_CHANGE_DV,     0x00190000   @ 25 (Q16) cost to flip planes
         .equ HOLD_DIST_SQ,        144   @ 12 px squared
         .equ HOLD_THRESH,         90    @ frames to trigger Deny completion
@@ -102,10 +104,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (84 words: 52 prior + 128 B debris).
+        @ Zero the state block (85 words: 84 prior + 4 B sensor_dir cache).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #84
+        mov     r2, #85
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -700,6 +702,14 @@ hold_advance:
         @ -------- RIC frame params (always computed; cheap, ~150 cycles) -
         bl      _compute_ric_params
 
+        @ -------- cache sensor_dir = atan2(player_vy, player_vx) -----
+        ldr     r12, =STATE
+        ldr     r0, [r12, #(S_PLAYER + 12)]
+        ldr     r1, [r12, #(S_PLAYER + 8)]
+        bl      fx_atan2
+        ldr     r12, =STATE
+        str     r0, [r12, #S_SENSOR_DIR]
+
         @ -------- clear VRAM ------------------------------------------
         ldr     r0, =VRAM
         ldr     r1, =0x0421
@@ -763,27 +773,17 @@ star_skip:
         ldr     r3, =0x08AC                     @ dark amber
         bl      draw_disc
 
-        @ -------- targets (3x3 colored squares) -----------------------
-        ldr     r12, =STATE
-        ldr     r0, [r12, #S_T0]
-        ldr     r1, [r12, #(S_T0 + 4)]
-        bl      _world_to_screen
-        ldr     r2, =0x001F                     @ red
-        bl      draw_square3
-
-        ldr     r12, =STATE
-        ldr     r0, [r12, #S_T1]
-        ldr     r1, [r12, #(S_T1 + 4)]
-        bl      _world_to_screen
-        ldr     r2, =0x03E0                     @ green
-        bl      draw_square3
-
-        ldr     r12, =STATE
-        ldr     r0, [r12, #S_T2]
-        ldr     r1, [r12, #(S_T2 + 4)]
-        bl      _world_to_screen
-        ldr     r2, =0x7FE0                     @ cyan-white
-        bl      draw_square3
+        @ -------- targets (cone-filtered): full sprite if inside cone,
+        @          single grey pixel ("last known position") if outside.
+        mov     r0, #0
+        ldr     r1, =0x001F
+        bl      _draw_target
+        mov     r0, #1
+        ldr     r1, =0x03E0
+        bl      _draw_target
+        mov     r0, #2
+        ldr     r1, =0x7FE0
+        bl      _draw_target
 
         @ -------- debris (grey pixels) -------------------------------
         bl      _draw_debris
@@ -1268,6 +1268,88 @@ _dtick_next:
         cmp     r7, #DEBRIS_N
         blt     _dtick_loop
         pop     {r4-r10, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _draw_target(idx, color) -- transformed body draw, cone-filtered.
+@   r0 = target idx (0..2), r1 = BGR555 colour
+@ Inside sensor cone: full 3x3 sprite (draw_square3).
+@ Outside cone (or cross-plane): single dim-grey pixel at the projected
+@ screen position -- the "last known location" fog-of-war affordance.
+@ Cross-plane targets are also painted dim so the player still has
+@ situational awareness without being able to engage them.
+@ ----------------------------------------------------------------------------
+_draw_target:
+        push    {r4, r5, r6, r7, r8, lr}
+        mov     r4, r0                          @ idx
+        mov     r5, r1                          @ colour
+
+        ldr     r12, =STATE
+        mov     r6, r4, lsl #4
+        add     r6, r6, #S_T0
+        add     r6, r12, r6                     @ &target[idx]
+
+        @ Screen coords via active view.
+        ldr     r0, [r6, #0]
+        ldr     r1, [r6, #4]
+        bl      _world_to_screen
+        mov     r7, r0                          @ screen x
+        mov     r8, r1                          @ screen y
+
+        @ Cross-plane gate first: cross-plane -> always dim.
+        ldr     r12, =STATE
+        add     r0, r12, r4, lsl #2
+        ldr     r0, [r0, #S_T_PLANE]
+        ldr     r1, [r12, #S_PLAYER_PLANE]
+        cmp     r0, r1
+        bne     _dt_dim
+
+        @ Cone check: angle from sensor_dir to target.
+        ldr     r2, [r6, #0]
+        ldr     r3, [r6, #4]
+        ldr     r0, [r12, #S_PLAYER]
+        sub     r2, r2, r0
+        ldr     r0, [r12, #(S_PLAYER + 4)]
+        sub     r3, r3, r0
+        mov     r0, r3                          @ y arg
+        mov     r1, r2                          @ x arg
+        bl      fx_atan2
+        ldr     r12, =STATE
+        ldr     r1, [r12, #S_SENSOR_DIR]
+        sub     r0, r0, r1
+        mov     r0, r0, lsl #16
+        mov     r0, r0, asr #16
+        cmp     r0, #0
+        rsblt   r0, r0, #0
+        cmp     r0, #SENSOR_HALF_ANGLE
+        bgt     _dt_dim
+
+        @ Inside cone: full sprite.
+        mov     r0, r7
+        mov     r1, r8
+        mov     r2, r5
+        bl      draw_square3
+        b       _dt_done
+
+_dt_dim:
+        @ Single bright-grey pixel at the projected position.
+        cmp     r7, #0
+        blt     _dt_done
+        cmp     r7, #240
+        bge     _dt_done
+        cmp     r8, #0
+        blt     _dt_done
+        cmp     r8, #160
+        bge     _dt_done
+        mov     r0, #240
+        mul     r0, r8, r0
+        add     r0, r0, r7
+        ldr     r1, =VRAM
+        add     r0, r1, r0, lsl #1
+        ldr     r1, =0x4A52                     @ medium grey
+        strh    r1, [r0]
+_dt_done:
+        pop     {r4, r5, r6, r7, r8, lr}
         bx      lr
 
 @ ----------------------------------------------------------------------------
