@@ -49,6 +49,14 @@
         .equ S_PLAYER_EL, 0x50          @ player elements  { a, e, omega, nu } Q16
         .equ S_TARGET_EL, 0x60          @ target 0 elements (cached for HUD)
         .equ S_WARP,      0x70          @ time-warp substep count (1, 10, 100)
+        .equ S_VIEW_MODE, 0x74          @ 0 = ECI, 1 = RIC (centred on target 0)
+        .equ S_RIC_TX,    0x78          @ target ECI x_q16 cached for transform
+        .equ S_RIC_TY,    0x7C
+        .equ S_RIC_RX,    0x80          @ R-hat x in primary-centred Q16
+        .equ S_RIC_RY,    0x84
+        .equ S_RIC_IX,    0x88          @ I-hat x
+        .equ S_RIC_IY,    0x8C
+        .equ RIC_ZOOM_SHIFT, 14         @ Q16 ΔR/ΔI -> screen px:  >> (16-2) = ×4 zoom
 
         @ Tuning: planet at screen centre, MU sized for ~4-second orbits at
         @ radius 40 pixels. These match the defaults in physics.s.
@@ -70,10 +78,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (29 words: 80 B state + 32 B element cache + 4 B warp).
+        @ Zero the state block (36 words: 80 + 32 EL + 4 warp + 4 view + 24 RIC).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #29
+        mov     r2, #36
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -288,6 +296,15 @@ warp_store_l:
         str     r5, [r12, #S_WARP]
 no_warp_l:
 
+        @ -------- SELECT (bit 2): toggle ECI <-> RIC view -------------
+        tst     r4, #0x04
+        beq     no_view_toggle
+        ldr     r12, =STATE
+        ldr     r5, [r12, #S_VIEW_MODE]
+        eor     r5, r5, #1
+        str     r5, [r12, #S_VIEW_MODE]
+no_view_toggle:
+
         @ -------- Substep loop: cowell_step on each body, WARP times --
         ldr     r12, =STATE
         ldr     r5, [r12, #S_WARP]
@@ -362,6 +379,9 @@ no_collect:
         cmp     r6, #3
         blt     target_collide_loop
 
+        @ -------- RIC frame params (always computed; cheap, ~150 cycles) -
+        bl      _compute_ric_params
+
         @ -------- clear VRAM ------------------------------------------
         ldr     r0, =VRAM
         ldr     r1, =0x0421
@@ -400,50 +420,50 @@ star_skip:
         bne     star_loop
 
         @ -------- planet: three concentric bands -----------------------
+        @ Transform the fixed primary position through the active view.
+        ldr     r0, =PLANET_X_Q16
+        ldr     r1, =PLANET_Y_Q16
+        bl      _world_to_screen
+        mov     r4, r0                          @ planet screen x
+        mov     r5, r1                          @ planet screen y
         @ Outer rim (radius 14), light tan
-        mov     r0, #PLANET_X
-        mov     r1, #PLANET_Y
+        mov     r0, r4
+        mov     r1, r5
         mov     r2, #14
         ldr     r3, =0x3AFB                     @ pale tan BGR555
         bl      draw_disc
-
         @ Mid band (radius 10), warmer
-        mov     r0, #PLANET_X
-        mov     r1, #PLANET_Y
+        mov     r0, r4
+        mov     r1, r5
         mov     r2, #10
         ldr     r3, =0x126F                     @ rust orange
         bl      draw_disc
-
         @ Core (radius 5), deep
-        mov     r0, #PLANET_X
-        mov     r1, #PLANET_Y
+        mov     r0, r4
+        mov     r1, r5
         mov     r2, #5
         ldr     r3, =0x08AC                     @ dark amber
         bl      draw_disc
 
         @ -------- targets (3x3 colored squares) -----------------------
         ldr     r12, =STATE
-
         ldr     r0, [r12, #S_T0]
         ldr     r1, [r12, #(S_T0 + 4)]
-        mov     r0, r0, asr #16
-        mov     r1, r1, asr #16
+        bl      _world_to_screen
         ldr     r2, =0x001F                     @ red
         bl      draw_square3
 
         ldr     r12, =STATE
         ldr     r0, [r12, #S_T1]
         ldr     r1, [r12, #(S_T1 + 4)]
-        mov     r0, r0, asr #16
-        mov     r1, r1, asr #16
+        bl      _world_to_screen
         ldr     r2, =0x03E0                     @ green
         bl      draw_square3
 
         ldr     r12, =STATE
         ldr     r0, [r12, #S_T2]
         ldr     r1, [r12, #(S_T2 + 4)]
-        mov     r0, r0, asr #16
-        mov     r1, r1, asr #16
+        bl      _world_to_screen
         ldr     r2, =0x7FE0                     @ cyan-white
         bl      draw_square3
 
@@ -451,8 +471,7 @@ star_skip:
         ldr     r12, =STATE
         ldr     r0, [r12, #S_PLAYER]
         ldr     r1, [r12, #(S_PLAYER + 4)]
-        mov     r0, r0, asr #16                 @ int x
-        mov     r1, r1, asr #16                 @ int y
+        bl      _world_to_screen
         push    {r0, r1}                        @ save for nose
         ldr     r2, =0x7FFF                     @ white
         bl      draw_square3
@@ -566,7 +585,172 @@ skip_score:
         ldr     r3, =0x03FF                     @ bright yellow
         bl      _draw_hbar
 
+        @ ECI / RIC mode indicator at (230, 1): 1 px white = ECI, 4 px = RIC
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_VIEW_MODE]
+        mov     r2, #1
+        cmp     r0, #0
+        movne   r2, #4                          @ RIC -> 4 pixels
+        ldr     r3, =0x7FFF                     @ white in ECI
+        cmp     r0, #0
+        ldrne   r3, =0x03FF                     @ yellow in RIC
+        mov     r0, #230
+        mov     r1, #1
+        bl      _draw_hbar
+
         b       frame_loop
+
+@ ----------------------------------------------------------------------------
+@ _world_to_screen(body_x_q16, body_y_q16) -- ECI Q16 -> integer screen px.
+@   r0, r1 in: body position in ECI Q16
+@   r0, r1 out: integer screen pixel x, y
+@ Behaviour depends on S_VIEW_MODE:
+@   0 = ECI: straight Q16 -> int (asr #16); planet at screen centre.
+@   1 = RIC: subtract target ECI pos, decompose along R-hat / I-hat, scale
+@           by ZOOM = 4 (asr #14), centre at (120, 80).
+@ Clobbers r0-r3, r12 in ECI mode; pushes/pops r4-r6 in RIC mode.
+@ ----------------------------------------------------------------------------
+_world_to_screen:
+        ldr     r12, =STATE
+        ldr     r2, [r12, #S_VIEW_MODE]
+        cmp     r2, #0
+        beq     _w2s_eci
+
+        push    {r4, r5, r6, lr}
+        @ delta_x = body_x_eci - target_ECI_x
+        ldr     r3, [r12, #S_RIC_TX]
+        sub     r4, r0, r3              @ Δx (Q16)
+        ldr     r3, [r12, #S_RIC_TY]
+        sub     r5, r1, r3              @ Δy (Q16)
+
+        @ ΔR = Δx * R̂x + Δy * R̂y
+        mov     r0, r4
+        ldr     r12, =STATE
+        ldr     r1, [r12, #S_RIC_RX]
+        bl      fx_mul_q16
+        mov     r6, r0
+        mov     r0, r5
+        ldr     r12, =STATE
+        ldr     r1, [r12, #S_RIC_RY]
+        bl      fx_mul_q16
+        add     r6, r6, r0              @ r6 = ΔR (Q16)
+
+        @ ΔI = Δx * Îx + Δy * Îy
+        mov     r0, r4
+        ldr     r12, =STATE
+        ldr     r1, [r12, #S_RIC_IX]
+        bl      fx_mul_q16
+        mov     r4, r0                  @ reuse r4 = ΔI low
+        mov     r0, r5
+        ldr     r12, =STATE
+        ldr     r1, [r12, #S_RIC_IY]
+        bl      fx_mul_q16
+        add     r4, r4, r0              @ r4 = ΔI (Q16)
+
+        @ screen_x = 120 + (ΔI >> 14)    (asr to keep sign)
+        @ screen_y = 80  + (ΔR >> 14)
+        mov     r0, r4, asr #RIC_ZOOM_SHIFT
+        add     r0, r0, #120
+        mov     r1, r6, asr #RIC_ZOOM_SHIFT
+        add     r1, r1, #80
+        pop     {r4, r5, r6, lr}
+        bx      lr
+
+_w2s_eci:
+        mov     r0, r0, asr #16
+        mov     r1, r1, asr #16
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _compute_ric_params -- caches target ECI position + R̂ + Î for the active
+@ RIC view (always target 0 in this phase; mission FSM will pick later).
+@ Reads S_T0 in IWRAM; writes S_RIC_{TX,TY,RX,RY,IX,IY}.
+@ ----------------------------------------------------------------------------
+_compute_ric_params:
+        push    {r4, r5, r6, r7, lr}
+        ldr     r4, =STATE
+        ldr     r0, [r4, #S_T0]
+        str     r0, [r4, #S_RIC_TX]
+        ldr     r0, [r4, #(S_T0 + 4)]
+        str     r0, [r4, #S_RIC_TY]
+
+        @ Primary-centred TPX, TPY.
+        ldr     r0, [r4, #S_T0]
+        ldr     r1, =PLANET_X_Q16
+        sub     r5, r0, r1              @ TPX
+        ldr     r0, [r4, #(S_T0 + 4)]
+        ldr     r1, =PLANET_Y_Q16
+        sub     r6, r0, r1              @ TPY
+
+        @ |t| = sqrt(TPX^2 + TPY^2)
+        mov     r0, r5
+        mov     r1, r5
+        bl      fx_mul_q16
+        mov     r7, r0
+        mov     r0, r6
+        mov     r1, r6
+        bl      fx_mul_q16
+        add     r7, r7, r0
+        mov     r0, r7
+        bl      fx_sqrt_q16
+        mov     r7, r0                  @ |t|
+
+        @ Degenerate (target at primary): zero everything.
+        cmp     r7, #0x100
+        bgt     _ric_normal
+        mov     r0, #0
+        ldr     r4, =STATE
+        str     r0, [r4, #S_RIC_RX]
+        str     r0, [r4, #S_RIC_RY]
+        str     r0, [r4, #S_RIC_IX]
+        str     r0, [r4, #S_RIC_IY]
+        pop     {r4, r5, r6, r7, lr}
+        bx      lr
+
+_ric_normal:
+        @ R̂x = TPX / |t|
+        mov     r0, r5
+        mov     r1, r7
+        bl      fx_div_q16
+        ldr     r4, =STATE
+        str     r0, [r4, #S_RIC_RX]
+        @ R̂y = TPY / |t|
+        mov     r0, r6
+        mov     r1, r7
+        bl      fx_div_q16
+        ldr     r4, =STATE
+        str     r0, [r4, #S_RIC_RY]
+
+        @ Determine motion direction: cross = TPX*TVY - TPY*TVX.
+        ldr     r4, =STATE
+        ldr     r0, [r4, #(S_T0 + 12)]   @ TVY
+        mov     r1, r5
+        bl      fx_mul_q16              @ TPX*TVY
+        mov     r5, r0                  @ stash
+        ldr     r4, =STATE
+        ldr     r0, [r4, #(S_T0 + 8)]
+        mov     r1, r6
+        bl      fx_mul_q16              @ TPY*TVX
+        subs    r5, r5, r0              @ cross (signed); set flags
+
+        @ Î = (-R̂y, R̂x) if cross > 0 (CCW), else (R̂y, -R̂x).
+        ldr     r4, =STATE
+        ldr     r0, [r4, #S_RIC_RX]
+        ldr     r1, [r4, #S_RIC_RY]
+        bge     _ric_ccw
+        @ CW: Î = (R̂y, -R̂x)
+        str     r1, [r4, #S_RIC_IX]
+        rsb     r2, r0, #0
+        str     r2, [r4, #S_RIC_IY]
+        pop     {r4, r5, r6, r7, lr}
+        bx      lr
+_ric_ccw:
+        @ CCW: Î = (-R̂y, R̂x)
+        rsb     r2, r1, #0
+        str     r2, [r4, #S_RIC_IX]
+        str     r0, [r4, #S_RIC_IY]
+        pop     {r4, r5, r6, r7, lr}
+        bx      lr
 
 @ ----------------------------------------------------------------------------
 @ _apply_burn(dvx, dvy) -- adds an impulse to the player's velocity and
@@ -706,11 +890,21 @@ sq3_row:
         mov     r8, r5
         mov     r0, #3
 sq3_col:
+        @ Bounds-check pixel (r8, r4) against [0,240) x [0,160).
+        cmp     r8, #0
+        blt     sq3_skip
+        cmp     r8, #240
+        bge     sq3_skip
+        cmp     r4, #0
+        blt     sq3_skip
+        cmp     r4, #160
+        bge     sq3_skip
         mov     r1, #240
         mul     r3, r4, r1
         add     r3, r3, r8
         add     r3, r7, r3, lsl #1
         strh    r2, [r3]
+sq3_skip:
         add     r8, r8, #1
         subs    r0, r0, #1
         bne     sq3_col
@@ -745,6 +939,15 @@ disc_x2:
         bgt     disc_skip2
         add     r0, r4, r10                     @ px
         add     r1, r5, r9                      @ py
+        @ Bounds-check before VRAM write.
+        cmp     r0, #0
+        blt     disc_skip2
+        cmp     r0, #240
+        bge     disc_skip2
+        cmp     r1, #0
+        blt     disc_skip2
+        cmp     r1, #160
+        bge     disc_skip2
         mov     r2, #240
         mul     r2, r1, r2
         add     r2, r2, r0

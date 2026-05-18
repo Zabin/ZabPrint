@@ -130,13 +130,17 @@ def test_rom_element_cache_populated(rom_bytes):
 
 def test_rom_hud_a_bar_drawn(rom_bytes):
     """At y=3 (row 3), the player's a bar should paint cyan pixels (0x7FE0)
-    starting at x=2 for a non-zero length."""
+    starting at x=2 for a non-zero length. The clear loop spans most of each
+    frame, so we poll over several windows to catch the post-render state."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(400_000)
-    # Pixel at (2, 3) should be cyan (within rendered bar).
     pixel_addr = VRAM_BASE + ((3 * 240 + 2) * 2)
-    assert cpu.read_u16(pixel_addr) == 0x7FE0, \
-        f"expected cyan HUD a-bar pixel at (2, 3); got 0x{cpu.read_u16(pixel_addr):04X}"
+    seen_cyan = False
+    for _ in range(20):
+        cpu.run_for(50_000)
+        if cpu.read_u16(pixel_addr) == 0x7FE0:
+            seen_cyan = True
+            break
+    assert seen_cyan, "HUD a-bar pixel never observed cyan across 20 samples"
 
 
 def test_rom_orbital_motion_advances_targets(rom_bytes):
@@ -151,6 +155,34 @@ def test_rom_orbital_motion_advances_targets(rom_bytes):
     assert t0_x != 170 << 16 or t0_y != 80 << 16, "target 0 should have moved"
     # Specifically y should be strictly larger (it was 0 vx, +50774 vy).
     assert t0_y > 80 << 16, f"target 0 y should be > 80<<16; got 0x{t0_y:08X}"
+
+
+def test_rom_view_mode_defaults_to_eci(rom_bytes):
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(1500)
+    assert cpu.read_u32(IWRAM_BASE + 0x74) == 0
+
+
+def test_rom_select_toggles_view_mode(rom_bytes):
+    """Pressing SELECT (bit 2) once -> view_mode flips to 1 (RIC)."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x04)
+    cpu.run_for(80_000)
+    assert cpu.read_u32(IWRAM_BASE + 0x74) == 1
+
+
+def test_rom_ric_paints_target_at_screen_centre(rom_bytes):
+    """In RIC mode, target 0 (the reference) must paint its 3x3 sprite at
+    the screen centre (120, 80). Poll over several windows to catch a
+    post-render state (clear loop fills most of each frame)."""
+    cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x04)
+    pixel_addr = VRAM_BASE + ((80 * 240 + 120) * 2)
+    seen_red = False
+    for _ in range(20):
+        cpu.run_for(50_000)
+        if cpu.read_u16(pixel_addr) == 0x001F:
+            seen_red = True
+            break
+    assert seen_red, "target 0 red sprite never observed at screen centre in RIC mode"
 
 
 def test_rom_warp_inits_to_one(rom_bytes):
