@@ -157,6 +157,17 @@ def test_rom_orbital_motion_advances_targets(rom_bytes):
     assert t0_y > 80 << 16, f"target 0 y should be > 80<<16; got 0x{t0_y:08X}"
 
 
+def test_rom_mission_state_initialised(rom_bytes):
+    """mission_id (0=Deny), mission_target (0), hold_timers all zero at boot."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(1500)
+    assert cpu.read_u32(IWRAM_BASE + 0x90) == 0   # mission_id
+    assert cpu.read_u32(IWRAM_BASE + 0x98) == 0   # mission_target
+    assert cpu.read_u32(IWRAM_BASE + 0x9C) == 0   # hold_timer[0]
+    assert cpu.read_u32(IWRAM_BASE + 0xA0) == 0   # hold_timer[1]
+    assert cpu.read_u32(IWRAM_BASE + 0xA4) == 0   # hold_timer[2]
+
+
 def test_rom_view_mode_defaults_to_eci(rom_bytes):
     cpu = _make_cpu(rom_bytes)
     cpu.run_for(1500)

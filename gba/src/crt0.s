@@ -56,6 +56,13 @@
         .equ S_RIC_RY,    0x84
         .equ S_RIC_IX,    0x88          @ I-hat x
         .equ S_RIC_IY,    0x8C
+        .equ S_MISSION_ID,        0x90  @ 0=Deny 1=Degrade 2=Disrupt 3=Destroy 4=Deceive
+        .equ S_MISSION_PROGRESS,  0x94  @ frame counter or proxy
+        .equ S_MISSION_TARGET,    0x98  @ index into targets[3]
+        .equ S_HOLD_TIMERS,       0x9C  @ 3 words: per-target hold-at-risk frame counters
+        .equ HOLD_DIST_SQ,        144   @ 12 px squared
+        .equ HOLD_THRESH,         90    @ frames to trigger Deny completion
+        .equ DV_REFILL_Q16,       0x00190000   @ 25 (Q16) refill on mission complete
         .equ RIC_ZOOM_SHIFT, 14         @ Q16 ΔR/ΔI -> screen px:  >> (16-2) = ×4 zoom
 
         @ Tuning: planet at screen centre, MU sized for ~4-second orbits at
@@ -78,10 +85,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (36 words: 80 + 32 EL + 4 warp + 4 view + 24 RIC).
+        @ Zero the state block (42 words: 39 prior + 12 B hold_timers).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #36
+        mov     r2, #42
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -336,21 +343,22 @@ warp_substep_done:
         add     r1, r12, #S_TARGET_EL
         bl      _compute_elem_for_body
 
-        @ -------- target collision: each target vs player -------------
-        @ Player integer position
+        @ -------- holding-at-risk per target --------------------------
+        @ For each target i:
+        @   distance² (integer px) = (dx² + dy²) using truncated positions
+        @   if d² <= HOLD_DIST_SQ: hold_timer[i]++ else hold_timer[i] = 0
+        @   if hold_timer[i] >= HOLD_THRESH and mission_id == 0 (Deny) and
+        @     mission_target == i: advance mission, refill ΔV, etc.
         ldr     r12, =STATE
         ldr     r0, [r12, #S_PLAYER]
         ldr     r1, [r12, #(S_PLAYER + 4)]
-        mov     r4, r0, asr #16                 @ player int x
-        mov     r5, r1, asr #16                 @ player int y
-
-        mov     r6, #0                          @ target index 0..2
-target_collide_loop:
-        @ Compute byte offset of this target's state slot.
-        @ S_T0 + i*0x10
+        mov     r4, r0, asr #16
+        mov     r5, r1, asr #16
+        mov     r6, #0
+hold_check_loop:
         mov     r7, r6, lsl #4
         add     r7, r7, #S_T0
-        add     r8, r12, r7                     @ &target[i]
+        add     r8, r12, r7
         ldr     r0, [r8]
         ldr     r1, [r8, #4]
         mov     r0, r0, asr #16
@@ -360,24 +368,36 @@ target_collide_loop:
         mul     r0, r0, r0
         mul     r1, r1, r1
         add     r0, r0, r1
-        cmp     r0, #16                         @ within 4 pixels?
-        bgt     no_collect
-        @ Collected! Respawn from init_orbits[1 + i] (body 1, 2, 3).
-        ldr     r0, =init_orbits
-        add     r9, r6, #1                      @ body index 1, 2, 3
-        add     r0, r0, r9, lsl #4              @ + 16*body_idx
-        mov     r1, r8                          @ dst = target slot
-        push    {r6, r12, lr}
-        bl      _copy_orbit_body
-        pop     {r6, r12, lr}
-        @ Score++
-        ldr     r0, [r12, #S_SCORE]
-        add     r0, r0, #1
-        str     r0, [r12, #S_SCORE]
-no_collect:
+
+        @ Per-target hold-timer slot at S_HOLD_TIMERS + i*4
+        add     r2, r12, r6, lsl #2
+        ldr     r3, [r2, #S_HOLD_TIMERS]
+
+        cmp     r0, #HOLD_DIST_SQ
+        bgt     hold_reset
+        add     r3, r3, #1
+        b       hold_store
+hold_reset:
+        mov     r3, #0
+hold_store:
+        str     r3, [r2, #S_HOLD_TIMERS]
+
+        @ Mission completion check (Deny only here).
+        cmp     r3, #HOLD_THRESH
+        blt     hold_skip_mission
+        ldr     r1, [r12, #S_MISSION_ID]
+        cmp     r1, #0
+        bne     hold_skip_mission
+        ldr     r1, [r12, #S_MISSION_TARGET]
+        cmp     r1, r6
+        bne     hold_skip_mission
+        push    {r4, r5, r6, r12, lr}
+        bl      _advance_mission
+        pop     {r4, r5, r6, r12, lr}
+hold_skip_mission:
         add     r6, r6, #1
         cmp     r6, #3
-        blt     target_collide_loop
+        blt     hold_check_loop
 
         @ -------- RIC frame params (always computed; cheap, ~150 cycles) -
         bl      _compute_ric_params
@@ -585,6 +605,19 @@ skip_score:
         ldr     r3, =0x03FF                     @ bright yellow
         bl      _draw_hbar
 
+        @ Mission HUD: 5-pixel bar at (118, 4) colour-coded by mission_id.
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_MISSION_ID]
+        cmp     r0, #5
+        movge   r0, #0                          @ guard out-of-range
+        ldr     r1, =mission_color_table
+        add     r1, r1, r0, lsl #2
+        ldr     r3, [r1]
+        mov     r2, #5
+        mov     r0, #118
+        mov     r1, #4
+        bl      _draw_hbar
+
         @ ECI / RIC mode indicator at (230, 1): 1 px white = ECI, 4 px = RIC
         ldr     r12, =STATE
         ldr     r0, [r12, #S_VIEW_MODE]
@@ -750,6 +783,50 @@ _ric_ccw:
         str     r2, [r4, #S_RIC_IX]
         str     r0, [r4, #S_RIC_IY]
         pop     {r4, r5, r6, r7, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _advance_mission -- mission complete. Increments score by 5, refills ship_dv
+@ by DV_REFILL_Q16 (capped at DV_MAX), cycles mission_id mod 5, picks a new
+@ mission_target via frame_count mod 3, and clears all hold timers.
+@ Clobbers r0-r4, r12.
+@ ----------------------------------------------------------------------------
+_advance_mission:
+        push    {r4, lr}
+        ldr     r4, =STATE
+        @ score += 5
+        ldr     r0, [r4, #S_SCORE]
+        add     r0, r0, #5
+        str     r0, [r4, #S_SCORE]
+        @ ship_dv += DV_REFILL_Q16 (cap DV_MAX)
+        ldr     r0, [r4, #S_SHIP_DV]
+        ldr     r1, =DV_REFILL_Q16
+        add     r0, r0, r1
+        ldr     r1, =DV_MAX
+        cmp     r0, r1
+        movgt   r0, r1
+        str     r0, [r4, #S_SHIP_DV]
+        @ mission_id = (mission_id + 1) mod 5
+        ldr     r0, [r4, #S_MISSION_ID]
+        add     r0, r0, #1
+        cmp     r0, #5
+        movge   r0, #0
+        str     r0, [r4, #S_MISSION_ID]
+        @ mission_target = (frame_count & 0x3F) mod 3
+        ldr     r0, [r4, #S_FRAME]
+        and     r0, r0, #0x3F
+_mod3_loop:
+        cmp     r0, #3
+        subge   r0, r0, #3
+        bge     _mod3_loop
+        str     r0, [r4, #S_MISSION_TARGET]
+        @ Reset progress + hold timers
+        mov     r0, #0
+        str     r0, [r4, #S_MISSION_PROGRESS]
+        str     r0, [r4, #S_HOLD_TIMERS]
+        str     r0, [r4, #(S_HOLD_TIMERS + 4)]
+        str     r0, [r4, #(S_HOLD_TIMERS + 8)]
+        pop     {r4, lr}
         bx      lr
 
 @ ----------------------------------------------------------------------------
@@ -1021,5 +1098,19 @@ nose_dx:
         .word  3,  2,  0, -2, -3, -2,  0,  2
 nose_dy:
         .word  0,  2,  3,  2,  0, -2, -3, -2
+
+@ Mission HUD palette (BGR555).
+@   0 Deny      red
+@   1 Degrade   green
+@   2 Disrupt   blue
+@   3 Destroy   cyan
+@   4 Deceive   yellow
+        .align 2
+mission_color_table:
+        .word   0x001F
+        .word   0x03E0
+        .word   0x7C00
+        .word   0x7FE0
+        .word   0x03FF
 
         .ltorg
