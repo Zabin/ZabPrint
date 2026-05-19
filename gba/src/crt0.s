@@ -741,14 +741,24 @@ hold_advance:
         str     r0, [r12, #S_SENSOR_DIR]
 
         @ -------- clear VRAM ------------------------------------------
+        @ Use stmia with 8 registers per iter (16 pixels per iter) so the
+        @ clear fits inside VBlank (~83K cycles). The old single-str loop
+        @ ran past VBlank into VDraw, causing the LCD beam to read a
+        @ half-cleared framebuffer -> visible flicker.
         ldr     r0, =VRAM
         ldr     r1, =0x0421
         orr     r1, r1, r1, lsl #16
-        ldr     r2, =19200                      @ 240*160/2 (2 px per word write)
+        mov     r2, r1
+        mov     r3, r1
+        mov     r4, r1
+        mov     r5, r1
+        mov     r6, r1
+        mov     r7, r1
+        mov     r8, r1
+        ldr     r9, =2400                       @ 19200 words / 8 words-per-iter
 clear_loop:
-        str     r1, [r0]
-        add     r0, r0, #4
-        subs    r2, r2, #1
+        stmia   r0!, {r1-r8}
+        subs    r9, r9, #1
         bne     clear_loop
 
         @ -------- starfield -------------------------------------------
