@@ -79,12 +79,15 @@
         .equ SENSOR_HALF_ANGLE,   0x2000 @ 45° in brad: ±45° = 90° total cone
         .equ S_PATH_DIRTY,        0x154 @ low 4 bits = per-body dirty flag
         .equ S_PREV_NU,           0x158 @ prev frame's player true-anomaly (Q16 brads) for orbit-wrap detect
-        .equ S_PATH_PLAYER,       0x160 @ 64 points * 8 B = 512 B
-        .equ S_PATH_T0,           0x360
-        .equ S_PATH_T1,           0x560
-        .equ S_PATH_T2,           0x760
-        .equ PATH_N_POINTS,       64
-        .equ PATH_BYTES,          512  @ 64 * 8
+        .equ S_PATH_PLAYER,       0x160 @ 256 points * 8 B = 2048 B (full-orbit dashed line)
+        .equ S_PATH_T0,           0x960
+        .equ S_PATH_T1,           0x1160
+        .equ S_PATH_T2,           0x1960
+        .equ PATH_N_POINTS,       256
+        .equ PATH_BYTES,          2048 @ 256 * 8 -- enough substeps to close
+                                       @ a full orbit at default radius (T ~ 240 frames).
+        .equ PATH_DRAW_STRIDE,    8    @ visible-dot stride: 32 dots per orbit
+                                       @ (256 / 8) keeps render cost flat vs old N=64.
         .equ PLANE_CHANGE_DV,     0x00190000   @ 25 (Q16) cost to flip planes
         .equ HOLD_DIST_SQ,        144   @ 12 px squared
         .equ HOLD_THRESH,         90    @ frames to trigger Deny completion
@@ -115,10 +118,15 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (600 words: 85 prior + path caches up to 0x960).
+        @ Zero the control-state region (0..0x160, 88 words). The 8 KiB
+        @ path-cache region above 0x160 deliberately is NOT pre-zeroed:
+        @ dirty=0xF below causes _refresh_paths on frame 1 to overwrite
+        @ every byte of it before _draw_path consumes the cache. Keeping
+        @ this init short matters because every test in test_rom_execute.py
+        @ runs the ROM for a budgeted number of cycles.
         ldr     r0, =STATE
         mov     r1, #0
-        ldr     r2, =600
+        mov     r2, #100
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -1734,7 +1742,9 @@ _pp_loop:
 
 @ ----------------------------------------------------------------------------
 @ _draw_path(cache_ptr, color) -- paint dashed pixels for a path.
-@ Every-other-point sampling (32 visible dots out of 64 cached).
+@ Sub-samples every PATH_DRAW_STRIDE-th point so the per-frame draw cost
+@ stays flat as PATH_N_POINTS grows. With N=256, STRIDE=8 -> 32 dots, which
+@ visually closes a full orbit at the default radius.
 @   r0 = path cache pointer (PATH_BYTES of Q16 (x,y) pairs)
 @   r1 = colour (BGR555)
 @ Clobbers r2..r12.
@@ -1743,7 +1753,7 @@ _draw_path:
         push    {r4, r5, r6, r7, lr}
         mov     r4, r0                          @ ptr
         mov     r5, r1                          @ colour
-        mov     r6, #0                          @ index (0..63, increment by 2)
+        mov     r6, #0                          @ index (0..N-1, step PATH_DRAW_STRIDE)
 _dp_loop:
         @ Load (x, y) of point[i]
         ldr     r0, [r4, #0]
@@ -1765,32 +1775,44 @@ _dp_loop:
         add     r2, r3, r2, lsl #1
         strh    r5, [r2]
 _dp_skip:
-        add     r4, r4, #16                     @ advance by 2 points (8 B each)
-        add     r6, r6, #2
+        add     r4, r4, #(PATH_DRAW_STRIDE * 8) @ advance by STRIDE points (8 B each)
+        add     r6, r6, #PATH_DRAW_STRIDE
         cmp     r6, #PATH_N_POINTS
         blt     _dp_loop
         pop     {r4, r5, r6, r7, lr}
         bx      lr
 
 @ ----------------------------------------------------------------------------
-@ _refresh_paths -- if any per-body dirty bit set, recompute that body's path
-@ and clear the bit. Called once per frame before rendering.
+@ _refresh_paths -- recompute AT MOST ONE body's path per frame.
+@
+@ With PATH_N_POINTS=256 each predict_path is ~360K instructions (every
+@ cowell_step substep does several Q16 fx_div calls, and udiv64 alone is
+@ ~448 instructions). Refreshing all four at once on the boot frame
+@ would burn ~1.5M instructions and visibly stutter (also break
+@ test_rom_execute cycle budgets). Spreading the work across frames keeps
+@ each frame's worst case to one body of refresh, which fits comfortably
+@ in a normal frame budget; the cost the user pays is that at boot, the
+@ three target paths trickle in over the next three frames after the
+@ player path. After boot the dirty bits are rare (only set on burn or
+@ respawn) so the cost is unnoticeable in steady state.
+@
 @ Clobbers r0..r3, r12.
 @ ----------------------------------------------------------------------------
 _refresh_paths:
-        push    {r4, r5, r6, lr}
+        push    {r4, r5, lr}
         ldr     r4, =STATE
         ldr     r5, [r4, #S_PATH_DIRTY]
-        @ Player (bit 0)
+        @ Player (bit 0) -- highest priority since burns dirty only this bit.
         tst     r5, #1
         beq     _rp_t0
-        mov     r0, r4                          @ &player at STATE
+        mov     r0, r4
         ldr     r1, =(STATE + S_PATH_PLAYER)
         bl      _predict_path
         ldr     r4, =STATE
         ldr     r5, [r4, #S_PATH_DIRTY]
         bic     r5, r5, #1
         str     r5, [r4, #S_PATH_DIRTY]
+        b       _rp_done
 _rp_t0:
         tst     r5, #2
         beq     _rp_t1
@@ -1801,6 +1823,7 @@ _rp_t0:
         ldr     r5, [r4, #S_PATH_DIRTY]
         bic     r5, r5, #2
         str     r5, [r4, #S_PATH_DIRTY]
+        b       _rp_done
 _rp_t1:
         tst     r5, #4
         beq     _rp_t2
@@ -1811,6 +1834,7 @@ _rp_t1:
         ldr     r5, [r4, #S_PATH_DIRTY]
         bic     r5, r5, #4
         str     r5, [r4, #S_PATH_DIRTY]
+        b       _rp_done
 _rp_t2:
         tst     r5, #8
         beq     _rp_done
@@ -1822,7 +1846,7 @@ _rp_t2:
         bic     r5, r5, #8
         str     r5, [r4, #S_PATH_DIRTY]
 _rp_done:
-        pop     {r4, r5, r6, lr}
+        pop     {r4, r5, lr}
         bx      lr
 
 @ ----------------------------------------------------------------------------

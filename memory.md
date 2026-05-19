@@ -130,17 +130,28 @@ The interpreter (`toolchain/armsim.py`) covers every instruction
 0x154  path_dirty                                           4 B   (4 low bits)
 0x158  prev_nu                                              4 B   (8h: orbit wrap detect)
 0x15C  (pad to 0x160)                                       4 B
-0x160  path_player [64 points * 8 B]                      512 B
-0x360  path_target0                                        512 B
-0x560  path_target1                                        512 B
-0x760  path_target2                                        512 B
-0x960  end                                                ~2.4 KB total
+0x160  path_player [256 points * 8 B]                    2048 B  (full orbit)
+0x960  path_target0                                       2048 B
+0x1160 path_target1                                       2048 B
+0x1960 path_target2                                       2048 B
+0x2160 end                                                ~8.5 KB total
 ```
 
-`init_z` zero-fills 600 words (`ldr r2, =600`) on boot then seeds non-zero
-values (player + target ECI states, ship_dv = DV_MAX, warp = 1, healths,
-planes, grapple = -1, path_dirty = 0xF). Test offsets live in
-`tests/test_rom_execute.py` near the top of the file.
+`init_z` zero-fills 100 words (`mov r2, #100`, covers 0..0x190) on boot
+then seeds non-zero values (player + target ECI states, ship_dv = DV_MAX,
+warp = 1, healths, planes, grapple = -1, path_dirty = 0xF). The 8 KiB
+path-cache region above 0x160 deliberately is NOT pre-zeroed: dirty=0xF
+makes `_refresh_paths` overwrite every cache byte before the renderer
+reads it. Keeping init_z short is important because every test in
+`test_rom_execute.py` runs the ROM for a budgeted number of armsim
+instructions.
+
+`_refresh_paths` recomputes **at most one body's path per frame** (player
+first, then T0/T1/T2). Each `_predict_path` is ~360K armsim instructions
+(256 substeps × cowell_step, each cowell_step has 3 fx_div_q16 calls and
+udiv64 alone is ~448 instructions). Doing all 4 in one frame would burn
+~1.5M instructions and visibly stutter on the GBA. Spreading is cheap
+because dirty bits are normally 0 (only set on burn / respawn).
 
 ## Control mapping (current)
 
