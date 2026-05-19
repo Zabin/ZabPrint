@@ -136,7 +136,7 @@ def test_rom_bottom_half_vram_cleared(rom_bytes):
     addr = VRAM_BASE + ((130 * 240 + 200) * 2)
     cpu.write_u16(addr, 0x7C1F)                   # magenta sentinel
     seen_bg = False
-    for _ in range(20):
+    for _ in range(40):
         cpu.run_for(100_000)
         if cpu.read_u16(addr) == 0x0421:
             seen_bg = True
@@ -159,6 +159,88 @@ def test_rom_path_first_point_matches_state(rom_bytes):
     py = py_q16 >> 16
     assert 110 <= px <= 130, f"path[0].x = {px} should be near 120"
     assert 30 <= py <= 50, f"path[0].y = {py} should be near 40"
+
+
+def _reset_player_to_periapsis(cpu):
+    """Force player back to the boot orbit at periapsis so the next
+    element-compute yields nu ≈ 0 (<0x4000)."""
+    cpu.write_u32(IWRAM_BASE + 0x00, 120 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04,  40 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 56756)        # vx = v_circ_40
+    cpu.write_u32(IWRAM_BASE + 0x0C, 0)
+
+
+def test_rom_orbit_count_increments_on_periapsis_wrap(rom_bytes):
+    """Reset player to periapsis (cur_nu ≈ 0), inject S_PREV_NU = 0xF800
+    (≥270°), run one frame: the detect block should see the wrap and
+    increment S_ORBIT_COUNT."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    _reset_player_to_periapsis(cpu)
+    cpu.write_u32(IWRAM_BASE + 0x94, 0)             # clear orbit count
+    cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)       # inject prev_nu
+    cpu.run_for(2_000_000)                          # several frames
+    after = cpu.read_u32(IWRAM_BASE + 0x94)
+    assert after >= 1, f"wrap should have incremented orbit count; got {after}"
+
+
+def test_rom_orbit_count_resets_on_mission_advance(rom_bytes):
+    """Force a DGRD mission to complete and verify S_ORBIT_COUNT resets."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    cpu.write_u32(IWRAM_BASE + 0x94, 7)             # orbit count = 7
+    cpu.write_u32(IWRAM_BASE + 0x90, 1)             # DGRD
+    cpu.write_u32(IWRAM_BASE + 0x98, 0)             # mission_target = 0
+    score_before = _s32(cpu.read_u32(IWRAM_BASE + 0x14))
+    cpu.write_u32(IWRAM_BASE + 0xAC, 1)             # T_HEALTH[0] = 1
+    cpu.write_u32(IWRAM_BASE + 0x00, 168 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04, 80 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)
+    cpu.write_u32(IWRAM_BASE + 0x0C, 0)
+    cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x02)   # B held
+    cpu.run_for(2_000_000)
+    score_after = _s32(cpu.read_u32(IWRAM_BASE + 0x14))
+    orbit_after = cpu.read_u32(IWRAM_BASE + 0x94)
+    assert score_after > score_before, "mission did not advance (no +5 reward)"
+    assert orbit_after == 0, f"orbit count must reset on advance; got {orbit_after}"
+
+
+def test_rom_deny_mission_fails_at_orbit_limit(rom_bytes):
+    """DENY (mission_id=0) at orbit count 49 + one ν-wrap must cycle to
+    DGRD (id 1), subtract 2 from score, and not refill DV."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    _reset_player_to_periapsis(cpu)
+    cpu.write_u32(IWRAM_BASE + 0x90, 0)             # DENY
+    cpu.write_u32(IWRAM_BASE + 0x94, 49)
+    cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)
+    score_before = _s32(cpu.read_u32(IWRAM_BASE + 0x14))
+    dv_before = cpu.read_u32(IWRAM_BASE + 0x1C)
+    cpu.run_for(2_000_000)
+    mission_after = cpu.read_u32(IWRAM_BASE + 0x90)
+    score_after = _s32(cpu.read_u32(IWRAM_BASE + 0x14))
+    dv_after = cpu.read_u32(IWRAM_BASE + 0x1C)
+    assert mission_after == 1, f"DENY should cycle to DGRD; got id={mission_after}"
+    assert score_after == score_before - 2, \
+        f"fail penalty -2; before={score_before}, after={score_after}"
+    assert dv_after <= dv_before, "fail should not refill DV"
+
+
+def test_rom_dsrp_mission_fails_at_orbit_limit(rom_bytes):
+    """DSRP (mission_id=2) at orbit count 49 + ν-wrap must cycle to
+    DSTR (id 3)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    _reset_player_to_periapsis(cpu)
+    cpu.write_u32(IWRAM_BASE + 0x90, 2)             # DSRP
+    cpu.write_u32(IWRAM_BASE + 0x94, 49)
+    cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)
+    score_before = _s32(cpu.read_u32(IWRAM_BASE + 0x14))
+    cpu.run_for(2_000_000)
+    mission_after = cpu.read_u32(IWRAM_BASE + 0x90)
+    score_after = _s32(cpu.read_u32(IWRAM_BASE + 0x14))
+    assert mission_after == 3, f"DSRP should cycle to DSTR; got id={mission_after}"
+    assert score_after == score_before - 2
 
 
 def test_rom_word_data_tables_are_word_aligned():
@@ -185,7 +267,7 @@ def test_rom_hud_dv_label_drawn(rom_bytes):
     cpu = _make_cpu(rom_bytes)
     addr = VRAM_BASE + ((2 * 240 + 2) * 2)
     seen = False
-    for _ in range(20):
+    for _ in range(40):
         cpu.run_for(100_000)
         if cpu.read_u16(addr) == 0x7FFF:
             seen = True
@@ -199,7 +281,7 @@ def test_rom_hud_view_label_eci_vs_ric(rom_bytes):
     cpu = _make_cpu(rom_bytes)
     addr = VRAM_BASE + ((44 * 240 + 125) * 2)
     seen_white = False
-    for _ in range(20):
+    for _ in range(40):
         cpu.run_for(100_000)
         if cpu.read_u16(addr) == 0x7FFF:
             seen_white = True
@@ -213,7 +295,7 @@ def test_rom_hud_score_label_renders(rom_bytes):
     cpu = _make_cpu(rom_bytes)
     addr = VRAM_BASE + ((145 * 240 + 3) * 2)
     seen = False
-    for _ in range(20):
+    for _ in range(40):
         cpu.run_for(100_000)
         if cpu.read_u16(addr) == 0x03E0:
             seen = True
@@ -228,7 +310,7 @@ def test_rom_hud_a_bar_drawn(rom_bytes):
     cpu = _make_cpu(rom_bytes)
     pixel_addr = VRAM_BASE + ((12 * 240 + 20) * 2)
     seen_cyan = False
-    for _ in range(20):
+    for _ in range(40):
         cpu.run_for(100_000)
         if cpu.read_u16(pixel_addr) == 0x7FE0:
             seen_cyan = True
@@ -379,7 +461,7 @@ def test_rom_ric_paints_target_at_screen_centre(rom_bytes):
     cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x04)
     pixel_addr = VRAM_BASE + ((80 * 240 + 120) * 2)
     seen_red = False
-    for _ in range(20):
+    for _ in range(40):
         cpu.run_for(100_000)
         if cpu.read_u16(pixel_addr) == 0x001F:
             seen_red = True

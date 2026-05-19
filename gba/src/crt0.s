@@ -57,7 +57,7 @@
         .equ S_RIC_IX,    0x88          @ I-hat x
         .equ S_RIC_IY,    0x8C
         .equ S_MISSION_ID,        0x90  @ 0=Deny 1=Degrade 2=Disrupt 3=Destroy 4=Deceive
-        .equ S_MISSION_PROGRESS,  0x94  @ frame counter or proxy
+        .equ S_ORBIT_COUNT,       0x94  @ orbits since current mission started (reset on cycle)
         .equ S_MISSION_TARGET,    0x98  @ index into targets[3]
         .equ S_HOLD_TIMERS,       0x9C  @ 3 words: per-target hold-at-risk frame counters
         .equ S_DEW_COOLDOWN,      0xA8
@@ -76,6 +76,7 @@
         .equ S_SENSOR_DIR,        0x150 @ cached fx_atan2(vy, vx) for the cone
         .equ SENSOR_HALF_ANGLE,   0x2000 @ 45° in brad: ±45° = 90° total cone
         .equ S_PATH_DIRTY,        0x154 @ low 4 bits = per-body dirty flag
+        .equ S_PREV_NU,           0x158 @ prev frame's player true-anomaly (Q16 brads) for orbit-wrap detect
         .equ S_PATH_PLAYER,       0x160 @ 64 points * 8 B = 512 B
         .equ S_PATH_T0,           0x360
         .equ S_PATH_T1,           0x560
@@ -85,6 +86,7 @@
         .equ PLANE_CHANGE_DV,     0x00190000   @ 25 (Q16) cost to flip planes
         .equ HOLD_DIST_SQ,        144   @ 12 px squared
         .equ HOLD_THRESH,         90    @ frames to trigger Deny completion
+        .equ ORBIT_LIMIT,         50    @ DENY + DSRP missions fail at this many elapsed orbits
         .equ DEW_RANGE_SQ,        4900  @ 70 px squared
         .equ DEW_CD_FRAMES,       30
         .equ DEW_INIT_HEALTH,     3
@@ -660,6 +662,28 @@ warp_substep_done:
         add     r1, r12, #S_TARGET_EL
         bl      _compute_elem_for_body
 
+        @ -------- orbit detection (true-anomaly wrap = periapsis pass) -
+        @ cur_nu in S_PLAYER_EL+0x0C. Detect wrap from >=270° to <90° as
+        @ a completed orbit. Always update S_PREV_NU. On wrap, increment
+        @ S_ORBIT_COUNT and fail the mission if DENY/DSRP have hit the
+        @ ORBIT_LIMIT countdown.
+        ldr     r4, =STATE
+        ldr     r0, [r4, #(S_PLAYER_EL + 12)]   @ cur_nu (Q16 brad)
+        ldr     r1, [r4, #S_PREV_NU]            @ prev_nu
+        str     r0, [r4, #S_PREV_NU]            @ update cache regardless
+        ldr     r2, =0xC000                     @ 270° threshold
+        cmp     r1, r2
+        blt     _orbit_no_wrap
+        ldr     r2, =0x4000                     @ 90° threshold
+        cmp     r0, r2
+        bge     _orbit_no_wrap
+        @ Periapsis crossing detected.
+        ldr     r0, [r4, #S_ORBIT_COUNT]
+        add     r0, r0, #1
+        str     r0, [r4, #S_ORBIT_COUNT]
+        bl      _check_orbit_limit
+_orbit_no_wrap:
+
         @ -------- holding-at-risk per target --------------------------
         @ For each target i:
         @   distance² (integer px) = (dx² + dy²) using truncated positions
@@ -1115,6 +1139,31 @@ _ta_print:
         ldr     r3, =0x7FFF
         bl      _draw_dec
 
+        @ --- LAP nnn  (elapsed orbits since mission start; yellow if
+        @ DENY/DSRP is in the last 10 of ORBIT_LIMIT)
+        ldr     r0, =str_lap
+        mov     r1, #187
+        mov     r2, #44
+        ldr     r3, =0x7FFF
+        bl      _draw_str
+        ldr     r12, =STATE
+        ldr     r0, [r12, #S_ORBIT_COUNT]
+        @ Default colour = white; switch to yellow on DENY/DSRP danger zone.
+        ldr     r3, =0x7FFF
+        ldr     r4, [r12, #S_MISSION_ID]
+        cmp     r4, #0                          @ DENY?
+        beq     _lap_chk
+        cmp     r4, #2                          @ DSRP?
+        bne     _lap_draw
+_lap_chk:
+        rsb     r4, r0, #ORBIT_LIMIT            @ remaining = ORBIT_LIMIT - count
+        cmp     r4, #10
+        ldrle   r3, =0x03FF                     @ yellow (R+G)
+_lap_draw:
+        mov     r1, #204
+        mov     r2, #44
+        bl      _draw_dec
+
         @ --- Bottom row: SCORE nnnn (y=145)
         ldr     r0, =str_score
         mov     r1, #2
@@ -1310,6 +1359,36 @@ _advance_mission:
         cmp     r0, r1
         movgt   r0, r1
         str     r0, [r4, #S_SHIP_DV]
+        bl      _cycle_mission
+        pop     {r4, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _fail_mission -- like _advance_mission but on a TIMER-EXPIRY failure.
+@ Penalty: score -= 2. No DV refill. Mission cycles to the next.
+@ Clobbers r0-r4, r12.
+@ ----------------------------------------------------------------------------
+_fail_mission:
+        push    {r4, lr}
+        ldr     r4, =STATE
+        @ score -= 2
+        ldr     r0, [r4, #S_SCORE]
+        sub     r0, r0, #2
+        str     r0, [r4, #S_SCORE]
+        bl      _cycle_mission
+        pop     {r4, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _cycle_mission -- shared mission-cycling code used by both
+@ _advance_mission (win) and _fail_mission (timer expiry).
+@   mission_id = (id + 1) mod 5
+@   mission_target = (frame_count & 0x3F) mod 3
+@   S_ORBIT_COUNT = 0
+@   S_HOLD_TIMERS[0..2] = 0
+@ Caller must have r4 = STATE pointer; we preserve r4.
+@ ----------------------------------------------------------------------------
+_cycle_mission:
         @ mission_id = (mission_id + 1) mod 5
         ldr     r0, [r4, #S_MISSION_ID]
         add     r0, r0, #1
@@ -1324,14 +1403,33 @@ _mod3_loop:
         subge   r0, r0, #3
         bge     _mod3_loop
         str     r0, [r4, #S_MISSION_TARGET]
-        @ Reset progress + hold timers
+        @ Reset orbit count + hold timers
         mov     r0, #0
-        str     r0, [r4, #S_MISSION_PROGRESS]
+        str     r0, [r4, #S_ORBIT_COUNT]
         str     r0, [r4, #S_HOLD_TIMERS]
         str     r0, [r4, #(S_HOLD_TIMERS + 4)]
         str     r0, [r4, #(S_HOLD_TIMERS + 8)]
-        pop     {r4, lr}
         bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _check_orbit_limit -- called after every orbit increment. If the current
+@ mission is DENY (0) or DSRP (2) and the orbit count has reached
+@ ORBIT_LIMIT, trigger a mission failure.
+@   r4 = STATE pointer (caller sets up)
+@ Clobbers r0, r1.
+@ ----------------------------------------------------------------------------
+_check_orbit_limit:
+        ldr     r0, [r4, #S_MISSION_ID]
+        cmp     r0, #0                          @ DENY?
+        beq     _col_check
+        cmp     r0, #2                          @ DSRP?
+        bxne    lr
+_col_check:
+        ldr     r0, [r4, #S_ORBIT_COUNT]
+        cmp     r0, #ORBIT_LIMIT
+        bxlt    lr
+        @ Limit reached -- fail the mission.
+        b       _fail_mission
 
 @ ----------------------------------------------------------------------------
 @ _spawn_debris_at_player -- spawn DEBRIS_N debris bodies at the player's
@@ -2250,6 +2348,7 @@ str_wrp:   .byte 26, 22, 21, 0xFF              @ "WRP"
 str_mis:   .byte 18, 16, 23, 0xFF              @ "MIS"
 str_view:  .byte 25, 16, 14, 26, 0xFF          @ "VIEW"
 str_pln:   .byte 21, 17, 19, 0xFF              @ "PLN"
+str_lap:   .byte 17, 11, 21, 0xFF              @ "LAP"
 str_eci:   .byte 14, 12, 16, 0xFF              @ "ECI"
 str_ric:   .byte 22, 16, 12, 0xFF              @ "RIC"
 str_deny:  .byte 13, 14, 19, 27, 0xFF          @ "DENY"
