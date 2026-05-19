@@ -75,6 +75,13 @@
         .equ DEBRIS_HIT_SQ,       9     @ player collision radius squared (3 px)
         .equ S_SENSOR_DIR,        0x150 @ cached fx_atan2(vy, vx) for the cone
         .equ SENSOR_HALF_ANGLE,   0x2000 @ 45° in brad: ±45° = 90° total cone
+        .equ S_PATH_DIRTY,        0x154 @ low 4 bits = per-body dirty flag
+        .equ S_PATH_PLAYER,       0x160 @ 64 points * 8 B = 512 B
+        .equ S_PATH_T0,           0x360
+        .equ S_PATH_T1,           0x560
+        .equ S_PATH_T2,           0x760
+        .equ PATH_N_POINTS,       64
+        .equ PATH_BYTES,          512  @ 64 * 8
         .equ PLANE_CHANGE_DV,     0x00190000   @ 25 (Q16) cost to flip planes
         .equ HOLD_DIST_SQ,        144   @ 12 px squared
         .equ HOLD_THRESH,         90    @ frames to trigger Deny completion
@@ -104,10 +111,10 @@ _start:
         ldr     r1, =0x0403
         str     r1, [r0]
 
-        @ Zero the state block (85 words: 84 prior + 4 B sensor_dir cache).
+        @ Zero the state block (600 words: 85 prior + path caches up to 0x960).
         ldr     r0, =STATE
         mov     r1, #0
-        mov     r2, #85
+        ldr     r2, =600
 init_z:
         str     r1, [r0]
         add     r0, r0, #4
@@ -146,6 +153,9 @@ init_z:
         @ Grapple slot starts disengaged (-1).
         mvn     r1, #0
         str     r1, [r0, #S_GRAPPLE_TARGET]
+        @ Mark all 4 paths dirty so the first frame recomputes them.
+        mov     r1, #0xF
+        str     r1, [r0, #S_PATH_DIRTY]
 
 frame_loop:
         @ -------- vsync -----------------------------------------------
@@ -455,6 +465,16 @@ dew_scan_next:
         @ Also clear that target's hold-timer
         mov     r5, #0
         str     r5, [r3, #S_HOLD_TIMERS]
+        @ Mark that target's path dirty: bit (1 << (idx + 1)).
+        cmp     r2, #0
+        moveq   r5, #2
+        cmp     r2, #1
+        moveq   r5, #4
+        cmp     r2, #2
+        moveq   r5, #8
+        ldr     r3, [r12, #S_PATH_DIRTY]
+        orr     r3, r3, r5
+        str     r3, [r12, #S_PATH_DIRTY]
 
         @ Mission Degrade completion if matched
         ldr     r0, [r12, #S_MISSION_ID]
@@ -565,6 +585,16 @@ grapple_drag:
         str     r1, [r3, #S_T_HEALTH]
         mov     r1, #0
         str     r1, [r3, #S_HOLD_TIMERS]
+        @ Mark that target's path dirty.
+        cmp     r2, #0
+        moveq   r1, #2
+        cmp     r2, #1
+        moveq   r1, #4
+        cmp     r2, #2
+        moveq   r1, #8
+        ldr     r3, [r12, #S_PATH_DIRTY]
+        orr     r3, r3, r1
+        str     r3, [r12, #S_PATH_DIRTY]
         @ Score += 3.
         ldr     r1, [r12, #S_SCORE]
         add     r1, r1, #3
@@ -714,7 +744,7 @@ hold_advance:
         ldr     r0, =VRAM
         ldr     r1, =0x0421
         orr     r1, r1, r1, lsl #16
-        ldr     r2, =9600
+        ldr     r2, =19200                      @ 240*160/2 (2 px per word write)
 clear_loop:
         str     r1, [r0]
         add     r0, r0, #4
@@ -746,6 +776,21 @@ star_loop:
 star_skip:
         subs    r11, r11, #1
         bne     star_loop
+
+        @ -------- orbit-path prediction (recompute dirty, then draw all)
+        bl      _refresh_paths
+        ldr     r0, =(STATE + S_PATH_PLAYER)
+        ldr     r1, =0x4310                     @ dim cyan
+        bl      _draw_path
+        ldr     r0, =(STATE + S_PATH_T0)
+        ldr     r1, =0x0010                     @ dim red
+        bl      _draw_path
+        ldr     r0, =(STATE + S_PATH_T1)
+        ldr     r1, =0x0200                     @ dim green
+        bl      _draw_path
+        ldr     r0, =(STATE + S_PATH_T2)
+        ldr     r1, =0x4210                     @ dim cyan-grey
+        bl      _draw_path
 
         @ -------- planet: three concentric bands -----------------------
         @ Transform the fixed primary position through the active view.
@@ -1537,6 +1582,140 @@ _ddr_next:
         bx      lr
 
 @ ----------------------------------------------------------------------------
+@ _predict_path(body_ptr, out_ptr) -- forward-integrate PATH_N_POINTS
+@ substeps of cowell_step on a scratch copy of the body's state, storing
+@ (x_q16, y_q16) at each step into the out buffer (8 B per point).
+@   r0 = body state ptr (4 Q16 words: x, y, vx, vy)
+@   r1 = output cache ptr
+@ Real body state is left untouched.
+@ Clobbers r0..r3, r12; preserves r4-r11 via push/pop.
+@ ----------------------------------------------------------------------------
+_predict_path:
+        push    {r4, r5, r6, r7, r8, r9, lr}
+        @ Allocate 16 B of stack for scratch state copy.
+        sub     sp, sp, #16
+        mov     r4, sp                          @ scratch ptr
+        mov     r5, r1                          @ out ptr
+        @ Copy body state into scratch.
+        ldr     r6, [r0, #0]
+        str     r6, [r4, #0]
+        ldr     r6, [r0, #4]
+        str     r6, [r4, #4]
+        ldr     r6, [r0, #8]
+        str     r6, [r4, #8]
+        ldr     r6, [r0, #12]
+        str     r6, [r4, #12]
+        mov     r6, #PATH_N_POINTS              @ loop counter
+_pp_loop:
+        @ Store current (x, y) into out cache.
+        ldr     r7, [r4, #0]
+        str     r7, [r5, #0]
+        ldr     r7, [r4, #4]
+        str     r7, [r5, #4]
+        add     r5, r5, #8
+        @ Step the scratch copy.
+        mov     r0, r4
+        bl      cowell_step
+        subs    r6, r6, #1
+        bne     _pp_loop
+        add     sp, sp, #16
+        pop     {r4, r5, r6, r7, r8, r9, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _draw_path(cache_ptr, color) -- paint dashed pixels for a path.
+@ Every-other-point sampling (32 visible dots out of 64 cached).
+@   r0 = path cache pointer (PATH_BYTES of Q16 (x,y) pairs)
+@   r1 = colour (BGR555)
+@ Clobbers r2..r12.
+@ ----------------------------------------------------------------------------
+_draw_path:
+        push    {r4, r5, r6, r7, lr}
+        mov     r4, r0                          @ ptr
+        mov     r5, r1                          @ colour
+        mov     r6, #0                          @ index (0..63, increment by 2)
+_dp_loop:
+        @ Load (x, y) of point[i]
+        ldr     r0, [r4, #0]
+        ldr     r1, [r4, #4]
+        bl      _world_to_screen
+        @ r0 = sx, r1 = sy. Bounds-check + paint.
+        cmp     r0, #0
+        blt     _dp_skip
+        cmp     r0, #240
+        bge     _dp_skip
+        cmp     r1, #0
+        blt     _dp_skip
+        cmp     r1, #160
+        bge     _dp_skip
+        mov     r2, #240
+        mul     r2, r1, r2
+        add     r2, r2, r0
+        ldr     r3, =VRAM
+        add     r2, r3, r2, lsl #1
+        strh    r5, [r2]
+_dp_skip:
+        add     r4, r4, #16                     @ advance by 2 points (8 B each)
+        add     r6, r6, #2
+        cmp     r6, #PATH_N_POINTS
+        blt     _dp_loop
+        pop     {r4, r5, r6, r7, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _refresh_paths -- if any per-body dirty bit set, recompute that body's path
+@ and clear the bit. Called once per frame before rendering.
+@ Clobbers r0..r3, r12.
+@ ----------------------------------------------------------------------------
+_refresh_paths:
+        push    {r4, r5, r6, lr}
+        ldr     r4, =STATE
+        ldr     r5, [r4, #S_PATH_DIRTY]
+        @ Player (bit 0)
+        tst     r5, #1
+        beq     _rp_t0
+        mov     r0, r4                          @ &player at STATE
+        ldr     r1, =(STATE + S_PATH_PLAYER)
+        bl      _predict_path
+        ldr     r4, =STATE
+        ldr     r5, [r4, #S_PATH_DIRTY]
+        bic     r5, r5, #1
+        str     r5, [r4, #S_PATH_DIRTY]
+_rp_t0:
+        tst     r5, #2
+        beq     _rp_t1
+        add     r0, r4, #S_T0
+        ldr     r1, =(STATE + S_PATH_T0)
+        bl      _predict_path
+        ldr     r4, =STATE
+        ldr     r5, [r4, #S_PATH_DIRTY]
+        bic     r5, r5, #2
+        str     r5, [r4, #S_PATH_DIRTY]
+_rp_t1:
+        tst     r5, #4
+        beq     _rp_t2
+        add     r0, r4, #S_T1
+        ldr     r1, =(STATE + S_PATH_T1)
+        bl      _predict_path
+        ldr     r4, =STATE
+        ldr     r5, [r4, #S_PATH_DIRTY]
+        bic     r5, r5, #4
+        str     r5, [r4, #S_PATH_DIRTY]
+_rp_t2:
+        tst     r5, #8
+        beq     _rp_done
+        add     r0, r4, #S_T2
+        ldr     r1, =(STATE + S_PATH_T2)
+        bl      _predict_path
+        ldr     r4, =STATE
+        ldr     r5, [r4, #S_PATH_DIRTY]
+        bic     r5, r5, #8
+        str     r5, [r4, #S_PATH_DIRTY]
+_rp_done:
+        pop     {r4, r5, r6, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
 @ _apply_burn(dvx, dvy) -- adds an impulse to the player's velocity and
 @ decrements ship_dv by THRUST_COST. Caller must have already verified
 @ ship_dv > 0; we floor at 0 here for safety against repeated calls in
@@ -1558,6 +1737,10 @@ _apply_burn:
         cmp     r3, #0
         movlt   r3, #0
         str     r3, [r2, #S_SHIP_DV]
+        @ Player's path needs recomputation next frame.
+        ldr     r3, [r2, #S_PATH_DIRTY]
+        orr     r3, r3, #1
+        str     r3, [r2, #S_PATH_DIRTY]
         bx      lr
 
 @ ----------------------------------------------------------------------------

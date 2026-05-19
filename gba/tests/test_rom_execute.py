@@ -78,7 +78,7 @@ def test_rom_player_initial_position_q16(rom_bytes):
     """Player boots at (120, 40) -- 40 px above the central planet."""
     cpu = _make_cpu(rom_bytes)
     # Run just past the init-copy phase (small number of cycles).
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert cpu.read_u32(IWRAM_BASE + 0x00) == 120 << 16, "player_x should be 120 (Q16)"
     assert cpu.read_u32(IWRAM_BASE + 0x04) ==  40 << 16, "player_y should be 40 (Q16)"
     assert cpu.read_u32(IWRAM_BASE + 0x08) == 56756, "player_vx should be v_circ_40"
@@ -88,7 +88,7 @@ def test_rom_player_initial_position_q16(rom_bytes):
 def test_rom_targets_initial_orbits(rom_bytes):
     """All three targets boot at their seeded orbital states."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     # Target 0: (170, 80), v=(0, +50774)
     assert cpu.read_u32(IWRAM_BASE + 0x20) == 170 << 16
     assert cpu.read_u32(IWRAM_BASE + 0x24) ==  80 << 16
@@ -108,7 +108,7 @@ def test_rom_targets_initial_orbits(rom_bytes):
 
 def test_rom_score_starts_at_zero(rom_bytes):
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert cpu.read_u32(IWRAM_BASE + 0x14) == 0
 
 
@@ -126,6 +126,39 @@ def test_rom_element_cache_populated(rom_bytes):
     e_player_q16 = cpu.read_u32(IWRAM_BASE + 0x54)
     # Circular -> e near zero. Allow up to 0.25 (Q16: 0x4000).
     assert e_player_q16 < 0x4000, f"player e should be small; got 0x{e_player_q16:08X}"
+
+
+def test_rom_bottom_half_vram_cleared(rom_bytes):
+    """Layer 8f regression: the clear loop must wipe the WHOLE framebuffer,
+    not just the top half. Pre-paint a known colour at a bottom-half pixel
+    away from any sprite and verify the clear erases it within a frame."""
+    cpu = _make_cpu(rom_bytes)
+    addr = VRAM_BASE + ((130 * 240 + 200) * 2)
+    cpu.write_u16(addr, 0x7C1F)                   # magenta sentinel
+    seen_bg = False
+    for _ in range(20):
+        cpu.run_for(100_000)
+        if cpu.read_u16(addr) == 0x0421:
+            seen_bg = True
+            break
+    assert seen_bg, "pixel (200, 130) was never overwritten by the clear -- bottom half not being wiped"
+
+
+def test_rom_path_first_point_matches_state(rom_bytes):
+    """After the first frame's _refresh_paths runs, S_PATH_PLAYER[0]
+    holds the player's position at the moment the path was computed,
+    which is near (but not exactly) the boot value because one
+    cowell_step has run first."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)   # multiple frames; player path definitely populated
+    px_q16 = _s32(cpu.read_u32(IWRAM_BASE + 0x160))      # S_PATH_PLAYER + 0
+    py_q16 = _s32(cpu.read_u32(IWRAM_BASE + 0x164))      # S_PATH_PLAYER + 4
+    # Reasonable bounds: player still orbits near (120, 40) +/- ~10 px in
+    # the first few frames.
+    px = px_q16 >> 16
+    py = py_q16 >> 16
+    assert 110 <= px <= 130, f"path[0].x = {px} should be near 120"
+    assert 30 <= py <= 50, f"path[0].y = {py} should be near 40"
 
 
 def test_rom_word_data_tables_are_word_aligned():
@@ -153,7 +186,7 @@ def test_rom_hud_dv_label_drawn(rom_bytes):
     addr = VRAM_BASE + ((2 * 240 + 2) * 2)
     seen = False
     for _ in range(20):
-        cpu.run_for(50_000)
+        cpu.run_for(100_000)
         if cpu.read_u16(addr) == 0x7FFF:
             seen = True
             break
@@ -167,7 +200,7 @@ def test_rom_hud_view_label_eci_vs_ric(rom_bytes):
     addr = VRAM_BASE + ((44 * 240 + 125) * 2)
     seen_white = False
     for _ in range(20):
-        cpu.run_for(50_000)
+        cpu.run_for(100_000)
         if cpu.read_u16(addr) == 0x7FFF:
             seen_white = True
             break
@@ -181,7 +214,7 @@ def test_rom_hud_score_label_renders(rom_bytes):
     addr = VRAM_BASE + ((145 * 240 + 3) * 2)
     seen = False
     for _ in range(20):
-        cpu.run_for(50_000)
+        cpu.run_for(100_000)
         if cpu.read_u16(addr) == 0x03E0:
             seen = True
             break
@@ -196,7 +229,7 @@ def test_rom_hud_a_bar_drawn(rom_bytes):
     pixel_addr = VRAM_BASE + ((12 * 240 + 20) * 2)
     seen_cyan = False
     for _ in range(20):
-        cpu.run_for(50_000)
+        cpu.run_for(100_000)
         if cpu.read_u16(pixel_addr) == 0x7FE0:
             seen_cyan = True
             break
@@ -219,7 +252,7 @@ def test_rom_orbital_motion_advances_targets(rom_bytes):
 
 def test_rom_player_plane_inits_zero(rom_bytes):
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert cpu.read_u32(IWRAM_BASE + 0xB8) == 0   # player_plane
 
 
@@ -227,7 +260,7 @@ def test_rom_start_toggles_plane_costs_dv(rom_bytes):
     """Pressing START with sufficient ΔV flips player_plane and subtracts
     PLANE_CHANGE_DV (25 << 16)."""
     cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x08)
-    cpu.run_for(80_000)
+    cpu.run_for(200_000)
     plane = cpu.read_u32(IWRAM_BASE + 0xB8)
     dv = cpu.read_u32(IWRAM_BASE + 0x1C)
     assert plane == 1, f"plane should flip to 1; got {plane}"
@@ -240,7 +273,7 @@ def test_rom_sensor_dir_cached_each_frame(rom_bytes):
     atan2(player_vy, player_vx). Boot velocity is (+v_circ, 0) so the
     heading is 0 brad (positive-x axis)."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(80_000)
+    cpu.run_for(200_000)
     sensor_dir = cpu.read_u32(IWRAM_BASE + 0x150) & 0xFFFF
     # After a frame or two, gravity has nudged vy slightly positive (the body
     # falls toward the primary), so heading drifts a few hundred brad off
@@ -252,7 +285,7 @@ def test_rom_sensor_dir_cached_each_frame(rom_bytes):
 def test_rom_grapple_target_inits_to_minus_one(rom_bytes):
     """S_GRAPPLE_TARGET at IWRAM 0xC8 boots to -1 (no active grapple)."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert _s32(cpu.read_u32(IWRAM_BASE + 0xC8)) == -1
 
 
@@ -262,13 +295,13 @@ def test_rom_grapple_acquires_nearest_same_plane_target(rom_bytes):
     with zero velocity beside target 0 (170, 80), then hold A and let a few
     frames run so the new keyinput is observed."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(50_000)   # past init copy + first vsync wait
+    cpu.run_for(100_000)   # past init copy + first vsync wait
     cpu.write_u32(IWRAM_BASE + 0x00, 168 << 16)
     cpu.write_u32(IWRAM_BASE + 0x04, 80 << 16)
     cpu.write_u32(IWRAM_BASE + 0x08, 0)
     cpu.write_u32(IWRAM_BASE + 0x0C, 0)
     cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x01)
-    cpu.run_for(300_000)
+    cpu.run_for(2_000_000)
     g = _s32(cpu.read_u32(IWRAM_BASE + 0xC8))
     assert g == 0, f"grapple should lock target 0; got {g}"
 
@@ -276,14 +309,14 @@ def test_rom_grapple_acquires_nearest_same_plane_target(rom_bytes):
 def test_rom_grapple_releases_when_a_not_held(rom_bytes):
     """A not held -> S_GRAPPLE_TARGET reset to -1 every frame."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(80_000)
+    cpu.run_for(200_000)
     assert _s32(cpu.read_u32(IWRAM_BASE + 0xC8)) == -1
 
 
 def test_rom_debris_slots_init_dead(rom_bytes):
     """All 4 debris alive flags are 0 at boot."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     for i in range(4):
         slot = IWRAM_BASE + 0xD0 + i * 32
         assert cpu.read_u32(slot + 16) == 0, f"debris {i} should boot dead"
@@ -297,7 +330,7 @@ def test_rom_dew_fires_on_b_press(rom_bytes):
     closer. After the shot dew_cooldown sets to 30; target 0's health
     drops from 3 to 2; targets 1+2 are untouched."""
     cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x02)
-    cpu.run_for(80_000)
+    cpu.run_for(200_000)
     cd = cpu.read_u32(IWRAM_BASE + 0xA8)
     assert cd >= 28, f"DEW should have fired (cooldown >= 28); got {cd}"
     health0 = cpu.read_u32(IWRAM_BASE + 0xAC + 0)
@@ -309,7 +342,7 @@ def test_rom_dew_fires_on_b_press(rom_bytes):
 def test_rom_dew_inits_healths_to_three(rom_bytes):
     """All three targets start at DEW_INIT_HEALTH = 3."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert cpu.read_u32(IWRAM_BASE + 0xAC + 0) == 3
     assert cpu.read_u32(IWRAM_BASE + 0xAC + 4) == 3
     assert cpu.read_u32(IWRAM_BASE + 0xAC + 8) == 3
@@ -318,7 +351,7 @@ def test_rom_dew_inits_healths_to_three(rom_bytes):
 def test_rom_mission_state_initialised(rom_bytes):
     """mission_id (0=Deny), mission_target (0), hold_timers all zero at boot."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert cpu.read_u32(IWRAM_BASE + 0x90) == 0   # mission_id
     assert cpu.read_u32(IWRAM_BASE + 0x98) == 0   # mission_target
     assert cpu.read_u32(IWRAM_BASE + 0x9C) == 0   # hold_timer[0]
@@ -328,14 +361,14 @@ def test_rom_mission_state_initialised(rom_bytes):
 
 def test_rom_view_mode_defaults_to_eci(rom_bytes):
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert cpu.read_u32(IWRAM_BASE + 0x74) == 0
 
 
 def test_rom_select_toggles_view_mode(rom_bytes):
     """Pressing SELECT (bit 2) once -> view_mode flips to 1 (RIC)."""
     cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x04)
-    cpu.run_for(80_000)
+    cpu.run_for(200_000)
     assert cpu.read_u32(IWRAM_BASE + 0x74) == 1
 
 
@@ -347,7 +380,7 @@ def test_rom_ric_paints_target_at_screen_centre(rom_bytes):
     pixel_addr = VRAM_BASE + ((80 * 240 + 120) * 2)
     seen_red = False
     for _ in range(20):
-        cpu.run_for(50_000)
+        cpu.run_for(100_000)
         if cpu.read_u16(pixel_addr) == 0x001F:
             seen_red = True
             break
@@ -357,14 +390,14 @@ def test_rom_ric_paints_target_at_screen_centre(rom_bytes):
 def test_rom_warp_inits_to_one(rom_bytes):
     """S_WARP at IWRAM 0x70 boots to 1 (real time)."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert cpu.read_u32(IWRAM_BASE + 0x70) == 1
 
 
 def test_rom_r_cycles_warp_up(rom_bytes):
     """Pressing R once advances 1 -> 10."""
     cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x100)
-    cpu.run_for(80_000)
+    cpu.run_for(200_000)
     assert cpu.read_u32(IWRAM_BASE + 0x70) == 10
 
 
@@ -390,7 +423,7 @@ def test_rom_warp_accelerates_orbit(rom_bytes):
 def test_rom_dv_inits_at_max(rom_bytes):
     """ship_dv at IWRAM 0x1C should boot to DV_MAX = 100 (Q16)."""
     cpu = _make_cpu(rom_bytes)
-    cpu.run_for(1500)
+    cpu.run_for(5000)
     assert cpu.read_u32(IWRAM_BASE + 0x1C) == 0x00640000
 
 
@@ -409,7 +442,7 @@ def test_rom_in_track_burn_grows_speed(rom_bytes):
     so vx grows by +BURN_DV. Orbital motion then evolves but vx stays above
     the boot circular value for the first frame after the burn."""
     cpu = _make_cpu(rom_bytes, keyinput=0xFFFF & ~0x10)
-    cpu.run_for(80_000)
+    cpu.run_for(200_000)
     vx = _s32(cpu.read_u32(IWRAM_BASE + 0x08))
     assert vx > 56756, f"in-track burn should grow vx; got 0x{vx:08X}"
 
