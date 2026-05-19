@@ -2,41 +2,43 @@
 @ crt0.s -- ROM entry + orbital game frame loop (Mode 3 bitmap).
 @
 @ Mechanics:
-@   * A single large primary at the screen centre. Mass parameter MU.
-@   * Player ship + 3 targets all orbit the primary under Newtonian gravity
-@     (Cowell step in physics.s, semi-implicit Euler, dt = 1 frame).
-@   * D-pad applies small impulses to the player's velocity vector, letting
-@     you raise / lower / re-shape your orbit.
-@   * Touch a target (integer pixel distance <= 4) -> score++ and the target
-@     respawns at its initial orbital state (kept in ROM as init_orbits).
+@   * Single primary at the screen centre, mass parameter MU.
+@   * Player + 3 targets orbit under Newtonian gravity (cowell_step in
+@     physics.s, semi-implicit Euler, dt = 1 frame).
+@   * D-pad applies single-impulse burns (in-track / radial) costed against a
+@     finite delta-V tank. Element kernel converts state->{a,e,omega,nu} for
+@     the HUD and mission-completion checks.
+@   * Mission state machine cycles through five doctrinal objectives
+@     (DENY, DGRD, DSRP, DSTR, DECV). DENY + DSRP have a 50-orbit fail timer.
+@   * Two weapons: grapple (A) tows targets to a graveyard radius; DEW (B)
+@     hitscan beam along the velocity vector. Destroy mission spawns persistent
+@     debris that drains DV + score on contact.
+@   * Two reference frames toggled by SELECT: ECI (planet centred) and RIC
+@     (target centred, axes aligned to its radial / in-track frame).
+@   * Time-warp at 1x / 10x / 100x via R; plane change via L (costs DV).
+@   * Predicted orbit paths -- 64 substep forward integration cached per body,
+@     drawn as dashed dim pixels. Recomputed only when state changes.
 @
 @ Art:
-@   * Procedural starfield (32 LCG stars, stable seed).
-@   * Big banded planet -- three concentric discs at the centre.
-@   * Targets: 3x3 squares in red/green/cyan.
-@   * Player ship: 3x3 white core + a yellow nose pixel offset in the
-@     direction of travel (8-way lookup from fx_atan2 output).
-@   * Score bar: bright-green horizontal pixels at top-left.
+@   * Procedural starfield (32 LCG stars, stable seed) + banded planet.
+@   * Bodies as 3x3 squares (player white; targets red / green / cyan).
+@   * 4x6 pixel font for HUD labels (DV / a / e / Ta / Te / WRP / MIS /
+@     VIEW / PLN / LAP / SCORE) + _draw_dec for numeric readouts.
 @
-@ State at IWRAM 0x03000000 (80 bytes / 20 words):
-@   +0x00  player  { x_q16, y_q16, vx_q16, vy_q16 }
-@   +0x10  prev_keys
-@   +0x14  score
-@   +0x18  frame_count
-@   +0x1C  (pad)
-@   +0x20  target 0 { x_q16, y_q16, vx_q16, vy_q16 }
-@   +0x30  target 1 { ... }
-@   +0x40  target 2 { ... }
+@ State at IWRAM 0x03000000 (~600 words zero-initialised; see "STATE block"
+@ section below for the full equate table). Keep memory.md in sync.
 @ ============================================================================
 
         .arm
         .align 4
 
+@ ---- MMIO -----------------------------------------------------------------
         .equ DISPCNT,     0x04000000
         .equ VCOUNT,      0x04000006
         .equ KEYINPUT,    0x04000130
         .equ VRAM,        0x06000000
 
+@ ---- STATE block (IWRAM @ 0x03000000) -------------------------------------
         .equ STATE,       0x03000000
         .equ S_PLAYER,    0x00
         .equ S_PREV,      0x10

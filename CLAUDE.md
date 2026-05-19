@@ -39,7 +39,8 @@ python -m assets.gen_all                # rebuild asset bins + png previews
 Tests come first. Every code change has a covering test, written before
 the implementation. Goldens are inline integer literals with the
 derivation noted in a comment. Tolerances are absolute integer bounds
-(no `pytest.approx` for fixed-point math). Current count is in `memory.md`.
+(no `pytest.approx` for fixed-point math). Current count is in `memory.md`
+(at the repo root, **not** inside `gba/`).
 
 ## Assembler gotchas
 
@@ -53,16 +54,20 @@ Things that bit us in past sessions:
 3. **`.space N`** is not implemented either. If you need padding, emit
    `.byte 0` or `.word 0` repeatedly via a generated source string.
 4. **`mov rX, #imm`** requires `imm` to be encodable as an 8-bit value
-   rotated right by an even amount. `mov r0, #-1` and `mov r0, #0xFFFFFFFF`
-   both fail. Use `mvn r0, #0` (= -1) or `ldr r0, =VALUE` (literal pool).
+   rotated right by an even amount. `mov r0, #-1` and `mov r0, #600` both
+   fail. Use `mvn r0, #0` (= -1) or `ldr r0, =VALUE` (literal pool).
 5. **Cond + S suffix** (e.g. `subhs`) was previously mis-parsed as
    `sub` + `h` + `s`. The fix landed in `split_cond()`; if you add new
    mnemonics, keep the "cond first, then S" order.
 6. **Shifted-register operands** like `mov r0, r1, lsl #4` come in as a
    third comma-split operand. `_tryparse_arm_dp` merges them back; if
    you add a new DP-style instruction, mirror that merge.
+   **Register-shifted** operands (`mov r0, r1, lsl r2`) are not
+   supported — use `cmp` + `moveq` cascades instead.
 7. **`.ltorg`** must be reachable within ±4 KiB of every `ldr =VALUE` site.
    For long files, flush the pool more than once.
+8. **`stmia` / `ldmia` reg-lists** tokenise per-comma, so the spelled-out
+   form `{r1, r2, r3, ...}` mis-parses. Use range syntax: `{r1-r8}`.
 
 ## ROM layout convention
 
@@ -81,12 +86,24 @@ deliberately for this reason.
 
 ## Game-state convention
 
-Live game state is at IWRAM `0x03000000+`. The layout is documented in
-the header of `src/crt0.s`. When you change the layout:
+Live game state is at IWRAM `0x03000000+`. The full equate table lives
+at the top of `src/crt0.s`; the byte map is mirrored in `memory.md` for
+cross-session continuity. When you change the layout:
 
 1. Update the equates in `crt0.s`.
-2. Update the `init_z` loop count if the size grows.
+2. Update the `init_z` loop count (currently 600 words) if the size grows.
 3. Update offset constants in `tests/test_rom_execute.py`.
+4. Refresh the IWRAM-map section in `memory.md`.
+
+## Render-loop budget
+
+Mode 3 framebuffer = 76 800 B. The VBlank window is ~83 K ARM cycles.
+The frame must finish VRAM clear + render before VCOUNT wraps past 160,
+or you get visible tearing. Current clear uses `stmia r0!, {r1-r8}` × 2400
+iterations (~40 K cycles); the rest is HUD + dashed-path + sprite draws.
+If a new feature pushes the budget, switch to a partial-clear scheme
+(only re-clear the moving regions) before adding more work to the
+clear path.
 
 ## What to ask before doing
 
@@ -105,3 +122,8 @@ B: audio; C: scene composition; D: first runnable ROM). At each, send
 the relevant preview file via `SendUserFile` and use `AskUserQuestion`
 to confirm direction before continuing. Milestone A, B, and D have
 already happened; C is partial.
+
+After D, the project has continued through layers 8c (orbital realism +
+combat), 8e (labeled HUD), 8f (clear-bug fix), 8g (orbit prediction),
+and 8h (orbit counter). See `memory.md` for the full layer ledger and
+test-count history.

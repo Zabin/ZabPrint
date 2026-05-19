@@ -48,8 +48,8 @@ e   ▓░░░░░░░  05       ← player eccentricity × 100
 Ta  ▓▓▓▓▓▓░░  38       ← target semi-major axis
 Te  ▓░░░░░░░  02       ← target eccentricity × 100
 
-WRP 1   MIS DENY   VIEW ECI   PLN 0     ← mode indicators
-                                         (bottom of screen)
+WRP 1   MIS DENY 03   VIEW ECI   PLN 0   LAP 03   ← mode indicators
+                                                     (bottom of screen)
 SCORE 0000
 ```
 
@@ -78,7 +78,10 @@ mission is shown in the HUD's `MIS` field.
 | DECV    | Match the target's orbit — same semi-major axis, eccentricity, and plane — and hold for 1.5 s. |
 
 Each completion awards 5 score points and 25 ΔV, then advances to the next
-mission type with a new randomly-chosen target.
+mission type with a new randomly-chosen target. The HUD's `LAP` field
+shows orbits elapsed since the mission started; **DENY and DSRP have a
+50-orbit fail timer** — overrun and the mission cycles with −2 score and
+no ΔV refill. The `LAP` digits turn yellow when ≤10 orbits remain.
 
 **Hard-kill penalty:** the DSTR mission spawns 4 debris objects on the target's
 trajectory. They orbit indefinitely and deal −1 score + 10 ΔV drain on contact.
@@ -109,6 +112,6 @@ gba/
   assets/      procedural graphics generators (palettes, fonts, planets, ships, UI)
   audio/       PSG + DirectSound PCM music and sfx generators
   src/         hand-authored ARM / Thumb assembly (the game itself)
-  tests/       pytest suite (356 tests, every layer)
+  tests/       pytest suite (360 tests, every layer)
   build/       (gitignored) ROM + previews
 ```
