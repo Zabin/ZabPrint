@@ -128,6 +128,23 @@ def test_rom_element_cache_populated(rom_bytes):
     assert e_player_q16 < 0x4000, f"player e should be small; got 0x{e_player_q16:08X}"
 
 
+def test_rom_word_data_tables_are_word_aligned():
+    """Regression: `.align 2` in this assembler means 2-BYTE alignment
+    (unlike GAS, which is 2^N). Tables that hold .word entries must use
+    `.align 4`, otherwise ldr on real ARM7TDMI returns rotated data."""
+    from toolchain.asm import assemble
+    src = (open('/home/user/ZabPrint/gba/src/crt0.s').read()
+           + open('/home/user/ZabPrint/gba/src/physics.s').read())
+    r = assemble(src, base_addr=0x080000C0)
+    for name in ['mission_names', 'mission_color_table',
+                 'init_orbits', 'nose_dx', 'nose_dy']:
+        addr = r.symbols[name]
+        assert (addr & 3) == 0, (
+            f"{name} @ 0x{addr:08X} is not word-aligned -- ldr will rotate "
+            "the loaded word on real hardware"
+        )
+
+
 def test_rom_hud_dv_label_drawn(rom_bytes):
     """The 'D' glyph of the 'DV' label is painted at (2, 2). Its first row
     bitmap is 0b1110 -> pixels at (2,2), (3,2), (4,2) get the white label

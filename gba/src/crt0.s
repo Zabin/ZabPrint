@@ -30,7 +30,7 @@
 @ ============================================================================
 
         .arm
-        .align 2
+        .align 4
 
         .equ DISPCNT,     0x04000000
         .equ VCOUNT,      0x04000006
@@ -1916,7 +1916,7 @@ disc_skip2:
 @   v_circ_30 = sqrt(30/30) * Q16  = 65536
 @   v_circ_60 = sqrt(30/60) * Q16  = 46341
 @ ----------------------------------------------------------------------------
-        .align 2
+        .align 4
 init_orbits:
         @ body 0 -- player at (120, 40), moving right
         .word 0x00780000        @ x = 120<<16
@@ -1955,7 +1955,7 @@ init_orbits:
 @   6 ->  -Y     (up)
 @   7 ->  +X -Y  (right-up)
 @ ----------------------------------------------------------------------------
-        .align 2
+        .align 4
 nose_dx:
         .word  3,  2,  0, -2, -3, -2,  0,  2
 nose_dy:
@@ -1967,7 +1967,7 @@ nose_dy:
 @   2 Disrupt   blue
 @   3 Destroy   cyan
 @   4 Deceive   yellow
-        .align 2
+        .align 4
 mission_color_table:
         .word   0x001F
         .word   0x03E0
@@ -1983,7 +1983,7 @@ mission_color_table:
 @   21='P' 22='R' 23='S' 24='T' 25='V' 26='W' 27='Y'
 @   28='a' (lowercase)  29='e' (lowercase)
 @ ----------------------------------------------------------------------------
-        .align 2
+        .align 4
 font_glyphs:
         @ 0: space
         .byte 0x0, 0x0, 0x0, 0x0, 0x0, 0x0
@@ -2047,7 +2047,7 @@ font_glyphs:
         .byte 0x0, 0x6, 0x9, 0xE, 0x8, 0x7
 
 @ Label strings: byte arrays of glyph indices, 0xFF-terminated.
-        .align 2
+        .align 4
 str_dv:    .byte 13, 25, 0xFF                  @ "DV"
 str_a:     .byte 28, 0xFF                      @ "a"
 str_e:     .byte 29, 0xFF                      @ "e"
@@ -2067,7 +2067,7 @@ str_decv:  .byte 13, 14, 12, 25, 0xFF          @ "DECV"
 str_score: .byte 23, 12, 20, 22, 14, 0xFF      @ "SCORE"
 
 @ Mission name pointer table, indexed by mission_id.
-        .align 2
+        .align 4
 mission_names:
         .word   str_deny
         .word   str_dgrd
