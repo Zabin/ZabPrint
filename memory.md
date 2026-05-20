@@ -63,7 +63,7 @@ axis + grapple range re-check) playtest fixes.
 | 8i — Phase-based LAP wrap detection | done | `af990ac` |
 | 8j — DEW respawn-in-place + RIC tracks mission target + per-mission reroll | done | `eb79b32` |
 | 8k — Per-body period-aware path coverage + grapple-tow teleport fix | done | `877dc00` |
-| 8m — LAP cumulative Δφ + path uses semi-major axis + grapple range re-check | done | pending |
+| 8m — LAP cumulative Δφ + path uses semi-major axis + grapple range re-check | done | `d6fbec8` |
 | 9a — Minimal ROM (boots, splash) | done | `508ecad` |
 | 9b — D-pad ship + starfield + planets | done | `4b0bad5` |
 | 9c — Drift physics + projectile | done (replaced) | `22ab75d` |
