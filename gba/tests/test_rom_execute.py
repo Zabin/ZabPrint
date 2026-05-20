@@ -161,27 +161,46 @@ def test_rom_path_first_point_matches_state(rom_bytes):
     assert 30 <= py <= 50, f"path[0].y = {py} should be near 40"
 
 
-def _reset_player_to_periapsis(cpu):
-    """Force player back to the boot orbit at periapsis so the next
-    element-compute yields nu ≈ 0 (<0x4000)."""
-    cpu.write_u32(IWRAM_BASE + 0x00, 120 << 16)
-    cpu.write_u32(IWRAM_BASE + 0x04,  40 << 16)
-    cpu.write_u32(IWRAM_BASE + 0x08, 56756)        # vx = v_circ_40
-    cpu.write_u32(IWRAM_BASE + 0x0C, 0)
+def _reset_player_to_phase_zero(cpu):
+    """Place player at position-phase 0 (planet-relative +x axis at radius
+    40) with tangential CW circular velocity, so the next frame's phase
+    is just past 0x0000."""
+    cpu.write_u32(IWRAM_BASE + 0x00, 160 << 16)    # planet_x + 40
+    cpu.write_u32(IWRAM_BASE + 0x04,  80 << 16)    # planet_y
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)             # vx = 0
+    cpu.write_u32(IWRAM_BASE + 0x0C, 56756)         # vy = +v_circ_40 (CW)
 
 
-def test_rom_orbit_count_increments_on_periapsis_wrap(rom_bytes):
-    """Reset player to periapsis (cur_nu ≈ 0), inject S_PREV_NU = 0xF800
-    (≥270°), run one frame: the detect block should see the wrap and
-    increment S_ORBIT_COUNT."""
+def test_rom_lap_phase_threshold_window(rom_bytes):
+    """Inject S_PREV_PHASE = 0xF800 (≥270°) with the player parked at
+    phase 0; on the next frame cur_phase is just past 0x0000 so the
+    threshold (prev≥0xC000 AND cur<0x4000) fires and S_ORBIT_COUNT
+    increments."""
     cpu = _make_cpu(rom_bytes)
     cpu.run_for(400_000)
-    _reset_player_to_periapsis(cpu)
+    _reset_player_to_phase_zero(cpu)
     cpu.write_u32(IWRAM_BASE + 0x94, 0)             # clear orbit count
-    cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)       # inject prev_nu
+    cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)       # inject prev_phase
     cpu.run_for(2_000_000)                          # several frames
     after = cpu.read_u32(IWRAM_BASE + 0x94)
     assert after >= 1, f"wrap should have incremented orbit count; got {after}"
+
+
+def test_rom_lap_increments_on_real_circular_orbit(rom_bytes):
+    """Pre-8i regression: a pure circular orbit (e≈0) never wraps because
+    ν = atan2(y,x) - ω jitters with ω. Post-8i this passes because we
+    detect wraps on position phase, not true anomaly. Run ~1.5 orbits at
+    warp=10 (period ≈ 29 warp-frames at r=40) and assert at least one
+    lap is registered."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    _reset_player_to_phase_zero(cpu)
+    cpu.write_u32(IWRAM_BASE + 0x94, 0)             # orbit_count = 0
+    cpu.write_u32(IWRAM_BASE + 0x158, 0)            # clear prev_phase
+    cpu.write_u32(IWRAM_BASE + 0x70, 10)            # warp = 10
+    cpu.run_for(20_000_000)                         # ~30 frames of motion at warp=10 = ≥1 period
+    after = cpu.read_u32(IWRAM_BASE + 0x94)
+    assert after >= 1, f"circular orbit should wrap at least once; got {after}"
 
 
 def test_rom_orbit_count_resets_on_mission_advance(rom_bytes):
@@ -210,7 +229,7 @@ def test_rom_deny_mission_fails_at_orbit_limit(rom_bytes):
     DGRD (id 1), subtract 2 from score, and not refill DV."""
     cpu = _make_cpu(rom_bytes)
     cpu.run_for(400_000)
-    _reset_player_to_periapsis(cpu)
+    _reset_player_to_phase_zero(cpu)
     cpu.write_u32(IWRAM_BASE + 0x90, 0)             # DENY
     cpu.write_u32(IWRAM_BASE + 0x94, 49)
     cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)
@@ -231,7 +250,7 @@ def test_rom_dsrp_mission_fails_at_orbit_limit(rom_bytes):
     DSTR (id 3)."""
     cpu = _make_cpu(rom_bytes)
     cpu.run_for(400_000)
-    _reset_player_to_periapsis(cpu)
+    _reset_player_to_phase_zero(cpu)
     cpu.write_u32(IWRAM_BASE + 0x90, 2)             # DSRP
     cpu.write_u32(IWRAM_BASE + 0x94, 49)
     cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)

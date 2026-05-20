@@ -78,7 +78,7 @@
         .equ S_SENSOR_DIR,        0x150 @ cached fx_atan2(vy, vx) for the cone
         .equ SENSOR_HALF_ANGLE,   0x2000 @ 45° in brad: ±45° = 90° total cone
         .equ S_PATH_DIRTY,        0x154 @ low 4 bits = per-body dirty flag
-        .equ S_PREV_NU,           0x158 @ prev frame's player true-anomaly (Q16 brads) for orbit-wrap detect
+        .equ S_PREV_PHASE,        0x158 @ prev frame's player position-phase (Q16 brads) for orbit-wrap detect
         .equ S_PATH_PLAYER,       0x160 @ 256 points * 8 B = 2048 B (full-orbit dashed line)
         .equ S_PATH_T0,           0x960
         .equ S_PATH_T1,           0x1160
@@ -672,22 +672,31 @@ warp_substep_done:
         add     r1, r12, #S_TARGET_EL
         bl      _compute_elem_for_body
 
-        @ -------- orbit detection (true-anomaly wrap = periapsis pass) -
-        @ cur_nu in S_PLAYER_EL+0x0C. Detect wrap from >=270° to <90° as
-        @ a completed orbit. Always update S_PREV_NU. On wrap, increment
-        @ S_ORBIT_COUNT and fail the mission if DENY/DSRP have hit the
-        @ ORBIT_LIMIT countdown.
+        @ -------- orbit detection (position-phase wrap) ---------------
+        @ Phase = atan2(player_y - planet_y, player_x - planet_x), in Q16
+        @ brads. Detect a CW wrap from >=270° to <90° as a completed orbit.
+        @ Phase is independent of orbit shape, so this fires reliably even
+        @ on near-circular orbits where ω (and thus ν) is numerical noise.
         ldr     r4, =STATE
-        ldr     r0, [r4, #(S_PLAYER_EL + 12)]   @ cur_nu (Q16 brad)
-        ldr     r1, [r4, #S_PREV_NU]            @ prev_nu
-        str     r0, [r4, #S_PREV_NU]            @ update cache regardless
-        ldr     r2, =0xC000                     @ 270° threshold
+        ldr     r0, [r4, #(S_PLAYER + 4)]       @ player y
+        ldr     r1, =PLANET_Y_Q16
+        sub     r0, r0, r1                       @ dy
+        ldr     r1, [r4, #S_PLAYER]              @ player x
+        ldr     r2, =PLANET_X_Q16
+        sub     r1, r1, r2                       @ dx
+        bl      fx_atan2                         @ r0 = phase
+        ldr     r4, =STATE                       @ reload (BIOS preserves r4, but cheap)
+        mov     r0, r0, lsl #16                  @ unsigned 16-bit mask via
+        mov     r0, r0, lsr #16                  @   shift left then right
+        ldr     r1, [r4, #S_PREV_PHASE]
+        str     r0, [r4, #S_PREV_PHASE]          @ update cache regardless
+        ldr     r2, =0xC000                      @ 270° threshold
         cmp     r1, r2
-        blt     _orbit_no_wrap
-        ldr     r2, =0x4000                     @ 90° threshold
+        blo     _orbit_no_wrap
+        ldr     r2, =0x4000                      @ 90° threshold
         cmp     r0, r2
-        bge     _orbit_no_wrap
-        @ Periapsis crossing detected.
+        bhs     _orbit_no_wrap
+        @ Orbit completed (CW phase wrap).
         ldr     r0, [r4, #S_ORBIT_COUNT]
         add     r0, r0, #1
         str     r0, [r4, #S_ORBIT_COUNT]
@@ -1413,12 +1422,15 @@ _mod3_loop:
         subge   r0, r0, #3
         bge     _mod3_loop
         str     r0, [r4, #S_MISSION_TARGET]
-        @ Reset orbit count + hold timers
+        @ Reset orbit count + hold timers + phase wrap cache
         mov     r0, #0
         str     r0, [r4, #S_ORBIT_COUNT]
         str     r0, [r4, #S_HOLD_TIMERS]
         str     r0, [r4, #(S_HOLD_TIMERS + 4)]
         str     r0, [r4, #(S_HOLD_TIMERS + 8)]
+        @ Clear S_PREV_PHASE so the next orbit-detect doesn't fire from a
+        @ stale prev-frame value carried across the mission boundary.
+        str     r0, [r4, #S_PREV_PHASE]
         bx      lr
 
 @ ----------------------------------------------------------------------------
