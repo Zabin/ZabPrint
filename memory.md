@@ -58,6 +58,10 @@ Last updated after the Layer 8h orbit-counter pass + post-8h refactor.
 | 8g — Orbit-path prediction (dashed lines) | done | `f67924b` |
 | 8g.b — stmia-based fast VRAM clear (anti-flicker) | done | `5e3fc46` |
 | 8h — Orbit counter + 50-orbit fail timer | done | `4a2589e` |
+| 8g.2 — Full-orbit dashed paths (256 substeps) + spread refresh | done | `98161ab` |
+| 8i — Phase-based LAP wrap detection | done | `af990ac` |
+| 8j — DEW respawn-in-place + RIC tracks mission target + per-mission reroll | done | `eb79b32` |
+| 8k — Per-body period-aware path coverage + grapple-tow teleport fix | done | `877dc00` |
 | 9a — Minimal ROM (boots, splash) | done | `508ecad` |
 | 9b — D-pad ship + starfield + planets | done | `4b0bad5` |
 | 9c — Drift physics + projectile | done (replaced) | `22ab75d` |
@@ -220,7 +224,10 @@ the hand-encoded entry branch and runs through `pack_rom()`.
 | 8c.9 (sensor cone) | 350 | +2 |
 | 8e (labeled HUD) | 354 | +4 |
 | 8f + 8g (clear fix + orbit paths) | 357 | +3 |
-| 8h (orbit counter) | **360** | +3 (deny / dsrp fail + count reset) |
+| 8h (orbit counter) | 360 | +3 (deny / dsrp fail + count reset) |
+| 8i (phase-based LAP) | 361 | +1 (real-orbit circular wrap) |
+| 8j (DEW respawn + RIC + reroll) | 364 | +3 (respawn-in-place, reroll, RIC mission target) |
+| 8k (period-aware paths + grapple fix) | **368** | +4 (cowell_step_dt × 2, _compute_path_dt, path closes) |
 
 ## Assembler quirks to remember (also in CLAUDE.md)
 
