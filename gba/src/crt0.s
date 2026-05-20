@@ -458,18 +458,11 @@ dew_scan_next:
         cmp     r3, #0
         bgt     dew_done
 
-        @ Respawn from init_orbits[1 + idx]
+        @ Layer 8j: respawn in place. Just restore HP; do NOT teleport the
+        @ target back to its init orbit (that's what caused the visible
+        @ position jump in both ECI and RIC). Orbit stays unchanged so the
+        @ path cache also stays valid -- no dirty mark needed.
         mov     r2, r0                          @ stash idx
-        add     r1, r2, #1                      @ body index (1, 2, 3)
-        ldr     r0, =init_orbits
-        add     r0, r0, r1, lsl #4
-        mov     r1, r12
-        add     r1, r1, r2, lsl #4
-        add     r1, r1, #S_T0
-        push    {r2, lr}
-        bl      _copy_orbit_body
-        pop     {r2, lr}
-        @ Reset that target's health to DEW_INIT_HEALTH
         ldr     r12, =STATE
         add     r3, r12, r2, lsl #2
         mov     r5, #DEW_INIT_HEALTH
@@ -477,16 +470,6 @@ dew_scan_next:
         @ Also clear that target's hold-timer
         mov     r5, #0
         str     r5, [r3, #S_HOLD_TIMERS]
-        @ Mark that target's path dirty: bit (1 << (idx + 1)).
-        cmp     r2, #0
-        moveq   r5, #2
-        cmp     r2, #1
-        moveq   r5, #4
-        cmp     r2, #2
-        moveq   r5, #8
-        ldr     r3, [r12, #S_PATH_DIRTY]
-        orr     r3, r3, r5
-        str     r3, [r12, #S_PATH_DIRTY]
 
         @ Mission Degrade completion if matched
         ldr     r0, [r12, #S_MISSION_ID]
@@ -1268,22 +1251,26 @@ _w2s_eci:
 
 @ ----------------------------------------------------------------------------
 @ _compute_ric_params -- caches target ECI position + R̂ + Î for the active
-@ RIC view (always target 0 in this phase; mission FSM will pick later).
-@ Reads S_T0 in IWRAM; writes S_RIC_{TX,TY,RX,RY,IX,IY}.
+@ RIC view. Layer 8j: target slot picked from S_MISSION_TARGET so RIC follows
+@ the mission's active body rather than always centring on T0.
+@ Writes S_RIC_{TX,TY,RX,RY,IX,IY}.
 @ ----------------------------------------------------------------------------
 _compute_ric_params:
-        push    {r4, r5, r6, r7, lr}
+        push    {r4, r5, r6, r7, r8, lr}
         ldr     r4, =STATE
-        ldr     r0, [r4, #S_T0]
+        @ r8 = STATE + (S_T0 base offset) + mission_target * 16
+        ldr     r8, [r4, #S_MISSION_TARGET]
+        add     r8, r4, r8, lsl #4              @ STATE + mt*16
+        ldr     r0, [r8, #S_T0]
         str     r0, [r4, #S_RIC_TX]
-        ldr     r0, [r4, #(S_T0 + 4)]
+        ldr     r0, [r8, #(S_T0 + 4)]
         str     r0, [r4, #S_RIC_TY]
 
         @ Primary-centred TPX, TPY.
-        ldr     r0, [r4, #S_T0]
+        ldr     r0, [r8, #S_T0]
         ldr     r1, =PLANET_X_Q16
         sub     r5, r0, r1              @ TPX
-        ldr     r0, [r4, #(S_T0 + 4)]
+        ldr     r0, [r8, #(S_T0 + 4)]
         ldr     r1, =PLANET_Y_Q16
         sub     r6, r0, r1              @ TPY
 
@@ -1309,7 +1296,7 @@ _compute_ric_params:
         str     r0, [r4, #S_RIC_RY]
         str     r0, [r4, #S_RIC_IX]
         str     r0, [r4, #S_RIC_IY]
-        pop     {r4, r5, r6, r7, lr}
+        pop     {r4, r5, r6, r7, r8, lr}
         bx      lr
 
 _ric_normal:
@@ -1327,13 +1314,12 @@ _ric_normal:
         str     r0, [r4, #S_RIC_RY]
 
         @ Determine motion direction: cross = TPX*TVY - TPY*TVX.
-        ldr     r4, =STATE
-        ldr     r0, [r4, #(S_T0 + 12)]   @ TVY
+        @ r8 still holds the mission-target slot pointer.
+        ldr     r0, [r8, #(S_T0 + 12)]   @ TVY
         mov     r1, r5
         bl      fx_mul_q16              @ TPX*TVY
         mov     r5, r0                  @ stash
-        ldr     r4, =STATE
-        ldr     r0, [r4, #(S_T0 + 8)]
+        ldr     r0, [r8, #(S_T0 + 8)]    @ TVX
         mov     r1, r6
         bl      fx_mul_q16              @ TPY*TVX
         subs    r5, r5, r0              @ cross (signed); set flags
@@ -1347,14 +1333,14 @@ _ric_normal:
         str     r1, [r4, #S_RIC_IX]
         rsb     r2, r0, #0
         str     r2, [r4, #S_RIC_IY]
-        pop     {r4, r5, r6, r7, lr}
+        pop     {r4, r5, r6, r7, r8, lr}
         bx      lr
 _ric_ccw:
         @ CCW: Î = (-R̂y, R̂x)
         rsb     r2, r1, #0
         str     r2, [r4, #S_RIC_IX]
         str     r0, [r4, #S_RIC_IY]
-        pop     {r4, r5, r6, r7, lr}
+        pop     {r4, r5, r6, r7, r8, lr}
         bx      lr
 
 @ ----------------------------------------------------------------------------
@@ -1422,6 +1408,11 @@ _mod3_loop:
         subge   r0, r0, #3
         bge     _mod3_loop
         str     r0, [r4, #S_MISSION_TARGET]
+        @ Layer 8j: reroll the new mission target's orbit so each mission
+        @ starts with fresh geometry. r0 currently holds the new target idx.
+        push    {r4, lr}
+        bl      _reroll_target_orbit
+        pop     {r4, lr}
         @ Reset orbit count + hold timers + phase wrap cache
         mov     r0, #0
         str     r0, [r4, #S_ORBIT_COUNT]
@@ -1452,6 +1443,90 @@ _col_check:
         bxlt    lr
         @ Limit reached -- fail the mission.
         b       _fail_mission
+
+@ ----------------------------------------------------------------------------
+@ _reroll_target_orbit(target_idx) -- pick a fresh orbit for the named
+@ target slot and write (x, y, vx, vy) to its state. Position is at radius
+@ 40 + (frame & 0x3F) in one of 8 directions; velocity is the CW-tangent
+@ circular velocity at that radius. Marks the target's path dirty so the
+@ orbit preview recomputes on the next frame. Called by _cycle_mission so
+@ each new mission gets visibly different geometry.
+@   r0 = target_idx (0..2)
+@ Clobbers r0-r12 (saves/restores callee-saved regs via push).
+@ ----------------------------------------------------------------------------
+_reroll_target_orbit:
+        push    {r4-r10, lr}
+        mov     r4, r0                          @ r4 = target_idx
+        ldr     r5, =STATE
+        ldr     r6, [r5, #S_FRAME]              @ PRNG seed
+        @ radius = 40 + (frame & 0x3F)    -> integer in [40, 103]
+        and     r7, r6, #0x3F
+        add     r7, r7, #40
+        mov     r7, r7, lsl #16                 @ r7 = radius (Q16 px)
+        @ direction idx in [0, 7] from a different slice of frame bits
+        mov     r8, r6, lsr #9
+        and     r8, r8, #0x07                   @ r8 = direction idx
+        @ target slot pointer = STATE + S_T0 + idx*16
+        add     r9, r5, r4, lsl #4
+        add     r9, r9, #S_T0                   @ r9 = target slot ptr
+
+        @ Position x = planet_x + r * cos(theta)
+        ldr     r0, =unit_vec_table
+        add     r0, r0, r8, lsl #3
+        ldr     r0, [r0]                         @ cos
+        mov     r1, r7
+        bl      fx_mul_q16                       @ r0 = r*cos
+        ldr     r1, =PLANET_X_Q16
+        add     r0, r0, r1
+        str     r0, [r9, #0]                     @ target.x
+
+        @ Position y = planet_y + r * sin(theta)
+        ldr     r0, =unit_vec_table
+        add     r0, r0, r8, lsl #3
+        ldr     r0, [r0, #4]                     @ sin
+        mov     r1, r7
+        bl      fx_mul_q16
+        ldr     r1, =PLANET_Y_Q16
+        add     r0, r0, r1
+        str     r0, [r9, #4]                     @ target.y
+
+        @ v_circ = sqrt(MU / r)
+        ldr     r0, =MU_Q16
+        mov     r1, r7
+        bl      fx_div_q16
+        bl      fx_sqrt_q16
+        mov     r6, r0                           @ r6 = v_circ
+
+        @ Velocity x = -sin(theta) * v_circ
+        ldr     r0, =unit_vec_table
+        add     r0, r0, r8, lsl #3
+        ldr     r0, [r0, #4]                     @ sin
+        rsb     r0, r0, #0                       @ -sin
+        mov     r1, r6
+        bl      fx_mul_q16
+        str     r0, [r9, #8]                     @ target.vx
+
+        @ Velocity y = cos(theta) * v_circ
+        ldr     r0, =unit_vec_table
+        add     r0, r0, r8, lsl #3
+        ldr     r0, [r0]                         @ cos
+        mov     r1, r6
+        bl      fx_mul_q16
+        str     r0, [r9, #12]                    @ target.vy
+
+        @ Mark target path dirty (bit 1 + idx).
+        ldr     r5, =STATE
+        ldr     r0, [r5, #S_PATH_DIRTY]
+        cmp     r4, #0
+        orreq   r0, r0, #2
+        cmp     r4, #1
+        orreq   r0, r0, #4
+        cmp     r4, #2
+        orreq   r0, r0, #8
+        str     r0, [r5, #S_PATH_DIRTY]
+
+        pop     {r4-r10, lr}
+        bx      lr
 
 @ ----------------------------------------------------------------------------
 @ _spawn_debris_at_player -- spawn DEBRIS_N debris bodies at the player's
@@ -2303,6 +2378,24 @@ mission_color_table:
         .word   0x7C00
         .word   0x7FE0
         .word   0x03FF
+
+@ ----------------------------------------------------------------------------
+@ Layer 8j: 8-direction unit vectors in Q16 (cos, sin) per entry, indexed
+@ 0..7 == 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°. Used by
+@ _reroll_target_orbit to pick a randomized direction for the new mission
+@ target without needing a runtime sin/cos.
+@   √2/2 ≈ 0.7071 * 65536 ≈ 46340 = 0xB505
+@ ----------------------------------------------------------------------------
+        .align 4
+unit_vec_table:
+        .word   0x10000,  0x00000              @ 0°
+        .word   0x0B505,  0x0B505              @ 45°
+        .word   0x00000,  0x10000              @ 90°
+        .word  -0x0B505,  0x0B505              @ 135°
+        .word  -0x10000,  0x00000              @ 180°
+        .word  -0x0B505, -0x0B505              @ 225°
+        .word   0x00000, -0x10000              @ 270°
+        .word   0x0B505, -0x0B505              @ 315°
 
 @ ----------------------------------------------------------------------------
 @ Pixel font: 4-wide x 6-tall glyphs, one byte per row, low 4 bits are pixels

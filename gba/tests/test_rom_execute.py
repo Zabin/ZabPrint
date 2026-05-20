@@ -473,6 +473,93 @@ def test_rom_select_toggles_view_mode(rom_bytes):
     assert cpu.read_u32(IWRAM_BASE + 0x74) == 1
 
 
+def test_rom_dew_kill_respawns_target_in_place(rom_bytes):
+    """Layer 8j: DEW kill should restore HP without teleporting the target.
+    Pre-stage target 0 at (140, 60), far from its init orbit at (170, 80).
+    Fire DEW (player nearby). After respawn, target 0 must still be near
+    (140, 60), not at the init position."""
+    cpu = _make_cpu(rom_bytes)                            # boot without B
+    cpu.run_for(400_000)
+    # Park target 0 at (140, 60) with no velocity; set HP=1 so one DEW kills.
+    cpu.write_u32(IWRAM_BASE + 0x20, 140 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x24,  60 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x28, 0)
+    cpu.write_u32(IWRAM_BASE + 0x2C, 0)
+    cpu.write_u32(IWRAM_BASE + 0xAC, 1)                   # T0 HP = 1
+    cpu.write_u32(IWRAM_BASE + 0xA8, 0)                   # DEW cooldown clear
+    # Park player near target 0 so DEW is in range.
+    cpu.write_u32(IWRAM_BASE + 0x00, 145 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04,  60 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)
+    cpu.write_u32(IWRAM_BASE + 0x0C, 0)
+    # Press B (edge transition from released to held) to fire DEW.
+    cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x02)
+    cpu.run_for(1_500_000)                                # let DEW fire + respawn
+    health = cpu.read_u32(IWRAM_BASE + 0xAC)
+    assert health == 3, f"T0 should respawn at full HP; got {health}"
+    x = _s32(cpu.read_u32(IWRAM_BASE + 0x20)) >> 16
+    y = _s32(cpu.read_u32(IWRAM_BASE + 0x24)) >> 16
+    # Allow some orbital drift but assert we're NOT at init (170, 80).
+    assert abs(x - 140) < 20 and abs(y - 60) < 20, \
+        f"T0 should respawn in place near (140, 60); got ({x}, {y})"
+    assert not (abs(x - 170) < 5 and abs(y - 80) < 5), \
+        f"T0 should NOT teleport to init (170, 80); got ({x}, {y})"
+
+
+def test_rom_mission_advance_rerolls_mission_target_orbit(rom_bytes):
+    """Layer 8j: completing a mission rerolls the new mission target's
+    orbit. Force a DGRD completion and assert the new mission_target's
+    position differs from its init-orbit position (it was randomised)."""
+    cpu = _make_cpu(rom_bytes)                            # boot without B
+    cpu.run_for(400_000)
+    cpu.write_u32(IWRAM_BASE + 0x90, 1)                   # mission = DGRD
+    cpu.write_u32(IWRAM_BASE + 0x98, 0)                   # mission_target = 0
+    cpu.write_u32(IWRAM_BASE + 0xAC, 1)                   # T0 HP = 1
+    cpu.write_u32(IWRAM_BASE + 0xA8, 0)                   # DEW cooldown clear
+    cpu.write_u32(IWRAM_BASE + 0x00, 168 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04,  80 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)
+    cpu.write_u32(IWRAM_BASE + 0x0C, 0)
+    cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x02)        # press B (edge)
+    cpu.run_for(2_000_000)
+    new_mt = cpu.read_u32(IWRAM_BASE + 0x98)
+    assert new_mt in (0, 1, 2), f"mission_target should be in [0,2]; got {new_mt}"
+    # Read the new mission target's (x, y)
+    base = 0x20 + (new_mt << 4)
+    x = _s32(cpu.read_u32(IWRAM_BASE + base)) >> 16
+    y = _s32(cpu.read_u32(IWRAM_BASE + base + 4)) >> 16
+    # The init positions are: T0=(170,80), T1=(120,110), T2=(60,80).
+    init_positions = {0: (170, 80), 1: (120, 110), 2: (60, 80)}
+    ix, iy = init_positions[new_mt]
+    # Must be sufficiently far from the init position to count as rerolled.
+    distance_sq = (x - ix) ** 2 + (y - iy) ** 2
+    assert distance_sq > 100, \
+        f"new mission_target {new_mt} expected rerolled away from init " \
+        f"({ix}, {iy}); got ({x}, {y}) d²={distance_sq}"
+
+
+def test_rom_ric_origin_follows_mission_target(rom_bytes):
+    """Layer 8j: S_RIC_TX/TY should track S_MISSION_TARGET, not always T0.
+    Set mission_target = 2, place target 2 at a distinct position, run one
+    frame, assert S_RIC_TX/TY equals target 2's (x, y)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    cpu.write_u32(IWRAM_BASE + 0x98, 2)                   # mission_target = 2
+    cpu.write_u32(IWRAM_BASE + 0x40,  50 << 16)           # T2 x
+    cpu.write_u32(IWRAM_BASE + 0x44, 110 << 16)           # T2 y
+    cpu.write_u32(IWRAM_BASE + 0x48, 0)
+    cpu.write_u32(IWRAM_BASE + 0x4C, 0)
+    cpu.run_for(1_500_000)                                # several frames so RIC params catch up
+    ric_tx = cpu.read_u32(IWRAM_BASE + 0x78)
+    ric_ty = cpu.read_u32(IWRAM_BASE + 0x7C)
+    t2_x = cpu.read_u32(IWRAM_BASE + 0x40)
+    t2_y = cpu.read_u32(IWRAM_BASE + 0x44)
+    assert ric_tx == t2_x, \
+        f"RIC origin x should track mission target 2 ({t2_x:#x}); got {ric_tx:#x}"
+    assert ric_ty == t2_y, \
+        f"RIC origin y should track mission target 2 ({t2_y:#x}); got {ric_ty:#x}"
+
+
 def test_rom_ric_paints_target_at_screen_centre(rom_bytes):
     """In RIC mode, target 0 (the reference) must paint its 3x3 sprite at
     the screen centre (120, 80). Poll over several windows to catch a
