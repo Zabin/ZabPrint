@@ -199,19 +199,20 @@ def _reset_player_to_phase_zero(cpu):
     cpu.write_u32(IWRAM_BASE + 0x0C, 56756)         # vy = +v_circ_40 (CW)
 
 
-def test_rom_lap_phase_threshold_window(rom_bytes):
-    """Inject S_PREV_PHASE = 0xF800 (≥270°) with the player parked at
-    phase 0; on the next frame cur_phase is just past 0x0000 so the
-    threshold (prev≥0xC000 AND cur<0x4000) fires and S_ORBIT_COUNT
-    increments."""
+def test_rom_lap_cum_phase_tips_over_threshold(rom_bytes):
+    """Layer 8m: with cumulative-delta orbit detection, seeding
+    S_CUM_PHASE = 0xFFFF and running for one frame must increment the
+    lap counter -- any positive Δphase pushes cum past 0x10000 and
+    fires a lap."""
     cpu = _make_cpu(rom_bytes)
     cpu.run_for(400_000)
     _reset_player_to_phase_zero(cpu)
-    cpu.write_u32(IWRAM_BASE + 0x94, 0)             # clear orbit count
-    cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)       # inject prev_phase
-    cpu.run_for(2_000_000)                          # several frames
+    cpu.write_u32(IWRAM_BASE + 0x94, 0)             # clear lap count
+    cpu.write_u32(IWRAM_BASE + 0x158, 0)            # prev_phase = 0 (matches parked phase)
+    cpu.write_u32(IWRAM_BASE + 0x15C, 0xFFFF)       # cum_phase one tick from wrap
+    cpu.run_for(2_000_000)
     after = cpu.read_u32(IWRAM_BASE + 0x94)
-    assert after >= 1, f"wrap should have incremented orbit count; got {after}"
+    assert after >= 1, f"cum past 0x10000 should fire lap; got {after}"
 
 
 def test_rom_lap_increments_on_real_circular_orbit(rom_bytes):
@@ -225,6 +226,7 @@ def test_rom_lap_increments_on_real_circular_orbit(rom_bytes):
     _reset_player_to_phase_zero(cpu)
     cpu.write_u32(IWRAM_BASE + 0x94, 0)             # orbit_count = 0
     cpu.write_u32(IWRAM_BASE + 0x158, 0)            # clear prev_phase
+    cpu.write_u32(IWRAM_BASE + 0x15C, 0)            # clear cum_phase
     cpu.write_u32(IWRAM_BASE + 0x70, 10)            # warp = 10
     cpu.run_for(20_000_000)                         # ~30 frames of motion at warp=10 = ≥1 period
     after = cpu.read_u32(IWRAM_BASE + 0x94)
@@ -260,7 +262,8 @@ def test_rom_deny_mission_fails_at_orbit_limit(rom_bytes):
     _reset_player_to_phase_zero(cpu)
     cpu.write_u32(IWRAM_BASE + 0x90, 0)             # DENY
     cpu.write_u32(IWRAM_BASE + 0x94, 49)
-    cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)
+    cpu.write_u32(IWRAM_BASE + 0x158, 0)            # prev_phase = 0
+    cpu.write_u32(IWRAM_BASE + 0x15C, 0xFFFF)       # cum_phase one tick from wrap
     score_before = _s32(cpu.read_u32(IWRAM_BASE + 0x14))
     dv_before = cpu.read_u32(IWRAM_BASE + 0x1C)
     cpu.run_for(2_000_000)
@@ -281,7 +284,8 @@ def test_rom_dsrp_mission_fails_at_orbit_limit(rom_bytes):
     _reset_player_to_phase_zero(cpu)
     cpu.write_u32(IWRAM_BASE + 0x90, 2)             # DSRP
     cpu.write_u32(IWRAM_BASE + 0x94, 49)
-    cpu.write_u32(IWRAM_BASE + 0x158, 0xF800)
+    cpu.write_u32(IWRAM_BASE + 0x158, 0)            # prev_phase = 0
+    cpu.write_u32(IWRAM_BASE + 0x15C, 0xFFFF)       # cum_phase one tick from wrap
     score_before = _s32(cpu.read_u32(IWRAM_BASE + 0x14))
     cpu.run_for(2_000_000)
     mission_after = cpu.read_u32(IWRAM_BASE + 0x90)
@@ -713,4 +717,123 @@ def test_rom_idle_smoke_long_run(rom_bytes):
     for i in range(3):
         t = cpu.read_u32(IWRAM_BASE + 0x9C + i * 4)
         assert 0 <= t <= 1000, f"hold_timer {i} out of range: {t}"
+
+
+def test_rom_lap_does_not_increment_in_quarter_orbit_from_boot(rom_bytes):
+    """Layer 8m regression: with the old threshold-band detector, the
+    very first wrap of phase past 0xFFFF -> 0 fired the lap counter, and
+    from boot phase 0xC000 (270°) that happened after ~10 frames at
+    warp=10 (~1/3 of an orbit). Post-fix (cumulative phase delta), the
+    lap only fires after a full 2π of cumulative arc. Empirically at
+    warp=10 one orbit takes ~30 visible frames ≈ 11M cycles; run only
+    3M cycles (~10 frames, well under one orbit) and assert no lap."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)                  # boot complete
+    assert cpu.read_u32(IWRAM_BASE + 0x94) == 0, "boot orbit count should be 0"
+    cpu.write_u32(IWRAM_BASE + 0x70, 10)  # warp = 10
+    cpu.run_for(3_500_000)                # ~10 frames at warp=10; pre-fix ticked here
+    after = cpu.read_u32(IWRAM_BASE + 0x94)
+    assert after == 0, \
+        f"lap must not fire within the first ~1/3 orbit from boot; got {after}"
+
+
+def test_rom_lap_fires_once_per_full_orbit_from_boot(rom_bytes):
+    """Sanity-check companion to the quarter-orbit test: after just past
+    one full revolution at warp=10, the lap counter must have ticked
+    exactly once. Empirically lap=1 fires at ≈14.5M cycles past boot
+    and lap=2 at ≈24M. Run 18M cycles -- safely in the [lap=1] band."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    cpu.write_u32(IWRAM_BASE + 0x70, 10)
+    cpu.run_for(18_000_000)
+    after = cpu.read_u32(IWRAM_BASE + 0x94)
+    assert after == 1, \
+        f"exactly 1 lap should fire after one full orbit from boot; got {after}"
+
+
+def test_rom_path_closes_on_eccentric_orbit(rom_bytes):
+    """Layer 8m: _compute_path_dt must use semi-major axis a, not
+    instantaneous radius r. On an eccentric orbit started at apoapsis,
+    r >> a → the old r-based dt undersampled the period and the predicted
+    path didn't close. After the fix the 256-point path covers one full
+    period whether r=a (circular) or r≠a (elliptical)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    # Park player at (180, 80): r=60 along +x. Tangential vy = 30000 (Q16)
+    # well below v_circ_60 (46341) -> elliptical, start is apoapsis.
+    # eps = v²/2 - μ/r = (30000/65536)²/2 - 30/60 ≈ 0.1047 - 0.5 = -0.395
+    # a = -μ/(2*eps) ≈ 38 px (so r=60 sits at apoapsis with r/a ≈ 1.58).
+    cpu.write_u32(IWRAM_BASE + 0x00, 180 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04,  80 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)
+    cpu.write_u32(IWRAM_BASE + 0x0C, 30000)
+    cpu.write_u32(IWRAM_BASE + 0x154, 0xF)         # dirty all paths
+    cpu.run_for(2_000_000)                         # let player path refresh
+    p0_x = _s32(cpu.read_u32(IWRAM_BASE + 0x160)) >> 16
+    p0_y = _s32(cpu.read_u32(IWRAM_BASE + 0x164)) >> 16
+    p_last_x = _s32(cpu.read_u32(IWRAM_BASE + 0x958)) >> 16
+    p_last_y = _s32(cpu.read_u32(IWRAM_BASE + 0x95C)) >> 16
+    dist_sq = (p_last_x - p0_x) ** 2 + (p_last_y - p0_y) ** 2
+    # Pre-fix: dist_sq ~> 1500 px² (path covers only ~63% of period).
+    # Post-fix: within ~8 px after one full revolution (semi-implicit Euler
+    # accumulates some precession on eccentric orbits but stays bounded).
+    assert dist_sq <= 100, \
+        f"path[0]=({p0_x},{p0_y}) and path[255]=({p_last_x},{p_last_y}) " \
+        f"expected to close on an elliptical orbit; d²={dist_sq}"
+
+
+def test_rom_grapple_releases_when_target_out_of_range(rom_bytes):
+    """Layer 8m: once acquired, grapple_drag continued to tug the target's
+    velocity each frame regardless of how far the player drifted away.
+    Post-fix, grapple_drag re-checks distance every frame and releases when
+    the target is outside GRAPPLE_RANGE_SQ (64 px). Setup: pre-lock onto
+    target 0, park player far from it, hold A, run a frame -> grapple
+    must drop to -1."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    # Pre-acquire: lock grapple to target 0.
+    cpu.write_u32(IWRAM_BASE + 0xC8, 0)
+    cpu.write_u32(IWRAM_BASE + 0xCC, 5)            # mid-tow
+    # Park player at (10, 10), target 0 at (200, 150) -> distance ≈ 268 px,
+    # well outside GRAPPLE_RANGE = 64 px.
+    cpu.write_u32(IWRAM_BASE + 0x00,  10 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04,  10 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)
+    cpu.write_u32(IWRAM_BASE + 0x0C, 0)
+    cpu.write_u32(IWRAM_BASE + 0x20, 200 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x24, 150 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x28, 0)
+    cpu.write_u32(IWRAM_BASE + 0x2C, 0)
+    cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x01)  # A held
+    cpu.run_for(2_000_000)
+    g = _s32(cpu.read_u32(IWRAM_BASE + 0xC8))
+    assert g == -1, \
+        f"grapple should release when target is out of range; got idx={g}"
+
+
+def test_rom_grapple_does_not_perturb_distant_target_velocity(rom_bytes):
+    """Companion to the release test: even though grapple_target was
+    pre-set, the distant target's velocity must NOT have been pulled toward
+    the player. (Pre-fix, the drag dropped vy by ~12.5% per frame at d=∞.)
+    """
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    cpu.write_u32(IWRAM_BASE + 0xC8, 0)
+    cpu.write_u32(IWRAM_BASE + 0xCC, 5)
+    cpu.write_u32(IWRAM_BASE + 0x00,  10 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04,  10 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)
+    cpu.write_u32(IWRAM_BASE + 0x0C, 0)
+    cpu.write_u32(IWRAM_BASE + 0x20, 200 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x24, 150 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x28, 0)            # T0 vx = 0
+    cpu.write_u32(IWRAM_BASE + 0x2C, 40000)        # T0 vy = 40000
+    cpu.write_u16(IO_BASE + 0x130, 0xFFFF & ~0x01)
+    cpu.run_for(700_000)                            # one frame
+    vy_after = _s32(cpu.read_u32(IWRAM_BASE + 0x2C))
+    # Without the grapple-drag, vy only drifts via orbital gravity (small).
+    # Allow 5% slack for the cowell substep.
+    assert 38_000 <= vy_after <= 42_000, \
+        f"distant target's vy should not be perturbed by an out-of-range " \
+        f"grapple; got vy={vy_after} (expected ~40000)"
 

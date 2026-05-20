@@ -1,6 +1,7 @@
 # memory.md — cross-session state for the GBA space game
 
-Last updated after the Layer 8h orbit-counter pass + post-8h refactor.
+Last updated after Layer 8m (LAP cumulative Δφ + path uses semi-major
+axis + grapple range re-check) playtest fixes.
 
 ## Current state of the world
 
@@ -62,6 +63,7 @@ Last updated after the Layer 8h orbit-counter pass + post-8h refactor.
 | 8i — Phase-based LAP wrap detection | done | `af990ac` |
 | 8j — DEW respawn-in-place + RIC tracks mission target + per-mission reroll | done | `eb79b32` |
 | 8k — Per-body period-aware path coverage + grapple-tow teleport fix | done | `877dc00` |
+| 8m — LAP cumulative Δφ + path uses semi-major axis + grapple range re-check | done | pending |
 | 9a — Minimal ROM (boots, splash) | done | `508ecad` |
 | 9b — D-pad ship + starfield + planets | done | `4b0bad5` |
 | 9c — Drift physics + projectile | done (replaced) | `22ab75d` |
@@ -132,8 +134,8 @@ The interpreter (`toolchain/armsim.py`) covers every instruction
 0x0D0  debris[4] { x, y, vx, vy, alive, age, pad, pad }    128 B
 0x150  sensor_dir                                           4 B   (Q16 brad)
 0x154  path_dirty                                           4 B   (4 low bits)
-0x158  prev_nu                                              4 B   (8h: orbit wrap detect)
-0x15C  (pad to 0x160)                                       4 B
+0x158  prev_phase                                           4 B   (8m: 16-bit, prev frame's position phase)
+0x15C  cum_phase                                            4 B   (8m: signed 32-bit Σ Δphase; ±0x10000 = 1 lap)
 0x160  path_player [256 points * 8 B]                    2048 B  (full orbit)
 0x960  path_target0                                       2048 B
 0x1160 path_target1                                       2048 B
@@ -227,7 +229,8 @@ the hand-encoded entry branch and runs through `pack_rom()`.
 | 8h (orbit counter) | 360 | +3 (deny / dsrp fail + count reset) |
 | 8i (phase-based LAP) | 361 | +1 (real-orbit circular wrap) |
 | 8j (DEW respawn + RIC + reroll) | 364 | +3 (respawn-in-place, reroll, RIC mission target) |
-| 8k (period-aware paths + grapple fix) | **368** | +4 (cowell_step_dt × 2, _compute_path_dt, path closes) |
+| 8k (period-aware paths + grapple fix) | 368 | +4 (cowell_step_dt × 2, _compute_path_dt, path closes) |
+| 8m (LAP cum-Δ, path uses a not r, grapple range re-check) | **374** | +7 -1 (lap algo / eccentric path / grapple release) |
 
 ## Assembler quirks to remember (also in CLAUDE.md)
 

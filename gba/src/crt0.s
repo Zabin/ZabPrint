@@ -78,7 +78,8 @@
         .equ S_SENSOR_DIR,        0x150 @ cached fx_atan2(vy, vx) for the cone
         .equ SENSOR_HALF_ANGLE,   0x2000 @ 45° in brad: ±45° = 90° total cone
         .equ S_PATH_DIRTY,        0x154 @ low 4 bits = per-body dirty flag
-        .equ S_PREV_PHASE,        0x158 @ prev frame's player position-phase (Q16 brads) for orbit-wrap detect
+        .equ S_PREV_PHASE,        0x158 @ prev frame's player position-phase (16-bit brads) for cumulative-Δ orbit detect
+        .equ S_CUM_PHASE,         0x15C @ signed 32-bit cumulative phase since lap=0; ±0x10000 = one lap
         .equ S_PATH_PLAYER,       0x160 @ 256 points * 8 B = 2048 B (full-orbit dashed line)
         .equ S_PATH_T0,           0x960
         .equ S_PATH_T1,           0x1160
@@ -168,6 +169,12 @@ init_z:
         @ Mark all 4 paths dirty so the first frame recomputes them.
         mov     r1, #0xF
         str     r1, [r0, #S_PATH_DIRTY]
+
+        @ Seed S_PREV_PHASE from the player's current phase so the first
+        @ frame's orbit-detect delta is small (boot phase 0xC000) instead
+        @ of a 16k-brad spurious step from prev=0. init_z already cleared
+        @ S_CUM_PHASE so no zero-store needed here.
+        bl      _seed_player_phase
 
 frame_loop:
         @ -------- vsync -----------------------------------------------
@@ -537,12 +544,33 @@ grapple_scan_next:
         b       grapple_done
 
 grapple_drag:
-        @ r5 = grapple_target idx. Drag target velocity toward player:
-        @   vt += (vp - vt) >> 3
-        @ Then grapple_timer++; if >= GRAPPLE_FULL, complete.
+        @ r5 = grapple_target idx. Before applying the drag, re-check the
+        @ player-to-target distance: a locked grapple must release once the
+        @ target drifts outside GRAPPLE_RANGE_SQ, otherwise A held while
+        @ orbiting away keeps tugging a target the user can no longer see
+        @ in their RIC view ("changes target orbit while not nearby").
         mov     r6, r5, lsl #4
         add     r6, r6, #S_T0
         add     r6, r12, r6                     @ &target[idx]
+        ldr     r0, [r12, #S_PLAYER]
+        ldr     r1, [r12, #(S_PLAYER + 4)]
+        mov     r0, r0, asr #16                 @ player int x
+        mov     r1, r1, asr #16
+        ldr     r2, [r6, #0]
+        ldr     r3, [r6, #4]
+        mov     r2, r2, asr #16
+        mov     r3, r3, asr #16
+        sub     r0, r0, r2                       @ dx
+        sub     r1, r1, r3                       @ dy
+        mul     r0, r0, r0
+        mul     r1, r1, r1
+        add     r0, r0, r1                       @ d²
+        ldr     r1, =GRAPPLE_RANGE_SQ
+        cmp     r0, r1
+        bgt     grapple_clear                    @ out of range: drop lock
+        @ Still in range: drag target velocity toward player.
+        @   vt += (vp - vt) >> 3
+        @ Then grapple_timer++; if >= GRAPPLE_FULL, complete.
         ldr     r0, [r12, #(S_PLAYER + 8)]
         ldr     r1, [r6, #8]
         sub     r2, r0, r1
@@ -640,34 +668,56 @@ warp_substep_done:
         add     r1, r12, #S_TARGET_EL
         bl      _compute_elem_for_body
 
-        @ -------- orbit detection (position-phase wrap) ---------------
-        @ Phase = atan2(player_y - planet_y, player_x - planet_x), in Q16
-        @ brads. Detect a CW wrap from >=270° to <90° as a completed orbit.
-        @ Phase is independent of orbit shape, so this fires reliably even
-        @ on near-circular orbits where ω (and thus ν) is numerical noise.
+        @ -------- orbit detection (cumulative phase delta) -----------
+        @ Phase = atan2(dy, dx), 16-bit brads. Each frame we add the
+        @ signed-16 short-direction delta (cur - prev) to S_CUM_PHASE;
+        @ when |cum| crosses ±0x10000 the player has completed one full
+        @ revolution and S_ORBIT_COUNT ticks. Robust to any starting
+        @ phase (boot at 0xC000, mid-orbit mission resets, etc.) -- no
+        @ spurious wraps at threshold crossings.
+        @ Limitation: at warp+orbit combos where one frame advances >180°
+        @ of true anomaly the signed-Δ aliases. Default boot orbit
+        @ r=40 covers ≤35% of a period per frame at warp=100 so safe.
         ldr     r4, =STATE
-        ldr     r0, [r4, #(S_PLAYER + 4)]       @ player y
+        ldr     r0, [r4, #(S_PLAYER + 4)]
         ldr     r1, =PLANET_Y_Q16
         sub     r0, r0, r1                       @ dy
-        ldr     r1, [r4, #S_PLAYER]              @ player x
+        ldr     r1, [r4, #S_PLAYER]
         ldr     r2, =PLANET_X_Q16
         sub     r1, r1, r2                       @ dx
         bl      fx_atan2                         @ r0 = phase
-        ldr     r4, =STATE                       @ reload (BIOS preserves r4, but cheap)
-        mov     r0, r0, lsl #16                  @ unsigned 16-bit mask via
-        mov     r0, r0, lsr #16                  @   shift left then right
+        ldr     r4, =STATE
+        mov     r0, r0, lsl #16
+        mov     r0, r0, lsr #16                  @ cur (16-bit unsigned)
         ldr     r1, [r4, #S_PREV_PHASE]
-        str     r0, [r4, #S_PREV_PHASE]          @ update cache regardless
-        ldr     r2, =0xC000                      @ 270° threshold
+        str     r0, [r4, #S_PREV_PHASE]
+        sub     r0, r0, r1                       @ raw delta (cur - prev)
+        mov     r0, r0, lsl #16
+        mov     r0, r0, asr #16                  @ sign-extend low 16 bits
+        ldr     r1, [r4, #S_CUM_PHASE]
+        add     r1, r1, r0                       @ cum += delta_signed
+        ldr     r2, =0x10000
+_orbit_loop_pos:
         cmp     r1, r2
-        blo     _orbit_no_wrap
-        ldr     r2, =0x4000                      @ 90° threshold
-        cmp     r0, r2
-        bhs     _orbit_no_wrap
-        @ Orbit completed (CW phase wrap).
+        blt     _orbit_check_neg
+        sub     r1, r1, r2
         ldr     r0, [r4, #S_ORBIT_COUNT]
         add     r0, r0, #1
         str     r0, [r4, #S_ORBIT_COUNT]
+        b       _orbit_loop_pos
+_orbit_check_neg:
+        rsb     r3, r2, #0                       @ r3 = -0x10000
+        cmp     r1, r3
+        bgt     _orbit_done
+_orbit_loop_neg:
+        add     r1, r1, r2
+        ldr     r0, [r4, #S_ORBIT_COUNT]
+        add     r0, r0, #1
+        str     r0, [r4, #S_ORBIT_COUNT]
+        cmp     r1, r3
+        ble     _orbit_loop_neg
+_orbit_done:
+        str     r1, [r4, #S_CUM_PHASE]
         bl      _check_orbit_limit
 _orbit_no_wrap:
 
@@ -1398,15 +1448,44 @@ _mod3_loop:
         push    {r4, lr}
         bl      _reroll_target_orbit
         pop     {r4, lr}
-        @ Reset orbit count + hold timers + phase wrap cache
+        @ Reset orbit count + hold timers + phase accumulators.
         mov     r0, #0
         str     r0, [r4, #S_ORBIT_COUNT]
         str     r0, [r4, #S_HOLD_TIMERS]
         str     r0, [r4, #(S_HOLD_TIMERS + 4)]
         str     r0, [r4, #(S_HOLD_TIMERS + 8)]
-        @ Clear S_PREV_PHASE so the next orbit-detect doesn't fire from a
-        @ stale prev-frame value carried across the mission boundary.
+        str     r0, [r4, #S_CUM_PHASE]
+        @ Reseed S_PREV_PHASE from the player's current phase so the next
+        @ frame's delta starts fresh from where the player actually is,
+        @ not a stale or zero value.
+        push    {r4, lr}
+        bl      _seed_player_phase
+        pop     {r4, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _seed_player_phase -- compute the player's current position phase and
+@ store it to S_PREV_PHASE. Used at boot and on mission cycle so the
+@ cumulative orbit detector's first delta is small (Δ from current
+@ position to next-frame position) rather than a large junk value
+@ derived from prev=0.
+@ Clobbers r0-r3, r12.
+@ ----------------------------------------------------------------------------
+_seed_player_phase:
+        push    {r4, lr}
+        ldr     r4, =STATE
+        ldr     r0, [r4, #(S_PLAYER + 4)]
+        ldr     r1, =PLANET_Y_Q16
+        sub     r0, r0, r1
+        ldr     r1, [r4, #S_PLAYER]
+        ldr     r2, =PLANET_X_Q16
+        sub     r1, r1, r2
+        bl      fx_atan2
+        mov     r0, r0, lsl #16
+        mov     r0, r0, lsr #16
+        ldr     r4, =STATE
         str     r0, [r4, #S_PREV_PHASE]
+        pop     {r4, lr}
         bx      lr
 
 @ ----------------------------------------------------------------------------

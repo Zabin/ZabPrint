@@ -421,14 +421,14 @@ def test_cowell_step_dt_half_dt_advances_half_step(cowell_blob):
         f"half-dt should advance ~half: full_dy={full_dy} half_dy={half_dy}"
 
 
-def _arm_compute_path_dt(blob, x, y):
+def _arm_compute_path_dt(blob, x, y, vx=0, vy=0):
     cpu = ArmCpu()
     cpu.load_code(blob.bytes_, at=_BASE)
     state_addr = 0x1000
     cpu.write_u32(state_addr,      x  & 0xFFFFFFFF)
     cpu.write_u32(state_addr + 4,  y  & 0xFFFFFFFF)
-    cpu.write_u32(state_addr + 8,  0)
-    cpu.write_u32(state_addr + 12, 0)
+    cpu.write_u32(state_addr + 8,  vx & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 12, vy & 0xFFFFFFFF)
     cpu.set_reg(0, state_addr)
     cpu.set_reg(13, 0x10000)
     cpu.call(blob.symbols["_compute_path_dt"])
@@ -436,18 +436,57 @@ def _arm_compute_path_dt(blob, x, y):
 
 
 def test_compute_path_dt_matches_analytic(cowell_blob):
-    """dt should equal 2π·sqrt(r³/μ)/256 to within a few ULPs. μ = 30."""
+    """Post-Layer 8m: dt uses Kepler's third law on the SEMI-MAJOR AXIS a,
+    not the instantaneous radius r. For circular orbits a=r so the result
+    matches the legacy formula dt = 2π·sqrt(r³/μ)/256 to within a few
+    ULPs. We pass the circular-orbit velocity v_circ = sqrt(μ/r) so eps
+    yields a = r."""
     import math
     mu = 30.0
     for r in (20, 40, 80, 120, 180):
         x = _PLANET_X_Q16 + (r << 16)
         y = _PLANET_Y_Q16
-        got_q16 = _arm_compute_path_dt(cowell_blob, x, y)
+        v_circ_q16 = int(round(math.sqrt(mu / r) * 65536))
+        got_q16 = _arm_compute_path_dt(cowell_blob, x, y, vx=0, vy=v_circ_q16)
         got = got_q16 / 65536.0
         want = 2 * math.pi * math.sqrt(r ** 3 / mu) / 256
         rel = abs(got - want) / want
         assert rel < 0.01, \
             f"r={r}: got dt={got:.4f}, want {want:.4f} (rel err {rel:.4%})"
+
+
+def test_compute_path_dt_uses_semi_major_on_eccentric_orbits(cowell_blob):
+    """At apoapsis r > a, so the OLD (r-based) formula would overshoot the
+    period and the predicted path would overlap itself. With Kepler's
+    third law on a, the period is independent of where on the orbit we
+    sample. Verify: dt at apoapsis (r > a) matches dt at periapsis
+    (r < a) -- both should agree on the same period."""
+    import math
+    mu = 30.0
+    # Build an elliptical orbit with semi-major axis a=40, eccentricity 0.5
+    # (periapsis r_p = a(1-e) = 20, apoapsis r_a = a(1+e) = 60).
+    a = 40.0
+    e = 0.5
+    r_p = a * (1 - e)
+    r_a = a * (1 + e)
+    # v at periapsis: v_p² = μ * (2/r_p - 1/a)
+    v_p = math.sqrt(mu * (2 / r_p - 1 / a))
+    v_a = math.sqrt(mu * (2 / r_a - 1 / a))
+    # Apoapsis state: position +x at r_a, velocity tangential +y.
+    x_ap = _PLANET_X_Q16 + int(r_a * 65536)
+    y_ap = _PLANET_Y_Q16
+    vy_ap = int(round(v_a * 65536))
+    dt_ap = _arm_compute_path_dt(cowell_blob, x_ap, y_ap, 0, vy_ap) / 65536.0
+    # Periapsis state: position +x at r_p, velocity tangential +y.
+    x_pe = _PLANET_X_Q16 + int(r_p * 65536)
+    y_pe = _PLANET_Y_Q16
+    vy_pe = int(round(v_p * 65536))
+    dt_pe = _arm_compute_path_dt(cowell_blob, x_pe, y_pe, 0, vy_pe) / 65536.0
+    want = 2 * math.pi * math.sqrt(a ** 3 / mu) / 256
+    for name, got in (("apoapsis", dt_ap), ("periapsis", dt_pe)):
+        rel = abs(got - want) / want
+        assert rel < 0.02, \
+            f"{name}: got dt={got:.4f}, want {want:.4f} (rel err {rel:.4%})"
 
 
 # --- elements_from_state ------------------------------------------------

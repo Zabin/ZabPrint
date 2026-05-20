@@ -334,15 +334,20 @@ _csdt_skip_grav:
 @ _compute_path_dt(state_ptr) -> dt_q16
 @
 @ Returns a dt (Q16 substeps/frame) sized so cowell_step_dt iterated
-@ PATH_N_POINTS (256) times covers roughly one orbital period at the
-@ body's current radius from the primary. Approximates the orbit as
-@ circular at the current radius:
+@ PATH_N_POINTS (256) times covers roughly one orbital period for the
+@ body. Uses the semi-major axis a (Kepler's third law), not the
+@ instantaneous radius r, so the predicted path closes even on
+@ eccentric orbits where r != a at most points:
 @
-@     T   = 2π · sqrt(r³ / μ)
-@         = 2π · r · sqrt(r / μ)         (avoids r³ overflow in Q16)
+@     a   = -μ / (2 ε),   ε = v²/2 - μ/r
+@     T   = 2π · sqrt(a³ / μ)
+@         = 2π · a · sqrt(a / μ)         (avoids a³ overflow in Q16)
 @     dt  = T / 256                       (= T >> 8 in Q16)
 @
-@ A radius below 1.0 Q16 falls back to dt = 1.0.
+@ For unbound orbits (ε >= 0, parabolic / hyperbolic) we fall back to
+@ a = r so the path still samples something visible (open trajectory
+@ won't close, but it shows where the body is heading). Below r=1.0
+@ Q16 the body is essentially on the primary; emit dt = 1.0.
 @ ----------------------------------------------------------------------------
         .equ TWO_PI_Q16,   0x6487F      @ 2π × 65536 ≈ 411775
 
@@ -364,28 +369,57 @@ _compute_path_dt:
         mov     r0, r6
         mov     r1, r6
         bl      fx_mul_q16
-        add     r7, r7, r0              @ r²
+        add     r7, r7, r0              @ r7 = r²
         cmp     r7, #0x10000
         blo     _cpdt_min
         @ r = sqrt(r²)
         mov     r0, r7
         bl      fx_sqrt_q16
         mov     r5, r0                  @ r5 = r
-        @ r / μ
+        @ v² = vx² + vy²
+        ldr     r0, [r4, #8]
+        mov     r1, r0
+        bl      fx_mul_q16
+        mov     r6, r0
+        ldr     r0, [r4, #12]
+        mov     r1, r0
+        bl      fx_mul_q16
+        add     r6, r6, r0              @ r6 = v² (Q16)
+        @ μ / r
+        ldr     r0, =MU_Q16
+        mov     r1, r5
+        bl      fx_div_q16              @ r0 = μ/r (Q16)
+        @ ε = v²/2 - μ/r
+        sub     r7, r0, r6, asr #1      @ r7 = μ/r - v²/2 = -ε  (positive for bound)
+        @ Bound orbit needs -ε > 0 (i.e. r7 > 0); unbound -> use a = r.
+        cmp     r7, #1
+        blt     _cpdt_use_r
+        @ a = μ / (2 · (-ε)) = μ / (2 · r7)
+        ldr     r0, =MU_Q16
+        mov     r1, r7, lsl #1          @ 2 · (-ε); r7 is small Q16 so lsl #1 is safe
+        bl      fx_div_q16              @ r0 = a (Q16)
+        @ Sanity: if a came back larger than 256 px (Q16 0x01000000) the
+        @ orbit is near-parabolic; fall back to r to keep dt finite.
+        ldr     r1, =0x01000000
+        cmp     r0, r1
+        bge     _cpdt_use_r
+        mov     r5, r0                  @ r5 := a (replaces r for T formula)
+        b       _cpdt_period
+_cpdt_use_r:
+        @ r5 already holds r; treat that as the period-axis fallback.
+_cpdt_period:
+        @ T = 2π · a · sqrt(a / μ)
+        mov     r0, r5
         ldr     r1, =MU_Q16
-        bl      fx_div_q16
-        @ sqrt(r/μ)
-        bl      fx_sqrt_q16
-        mov     r6, r0                  @ sqrt(r/μ)
-        @ 2π · r
+        bl      fx_div_q16              @ a/μ
+        bl      fx_sqrt_q16             @ sqrt(a/μ)
+        mov     r6, r0
         mov     r0, r5
         ldr     r1, =TWO_PI_Q16
-        bl      fx_mul_q16
-        @ T = (2π · r) · sqrt(r/μ)
+        bl      fx_mul_q16              @ 2π · a
         mov     r1, r6
-        bl      fx_mul_q16
-        @ dt = T / 256 (T >> 8)
-        mov     r0, r0, asr #8
+        bl      fx_mul_q16              @ T
+        mov     r0, r0, asr #8          @ dt = T / 256
         pop     {r4-r7, lr}
         bx      lr
 _cpdt_min:
