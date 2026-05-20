@@ -245,6 +245,155 @@ _cs_skip_grav:
         bx      lr
 
 @ ----------------------------------------------------------------------------
+@ cowell_step_dt(state_ptr, dt) -- same as cowell_step but the velocity
+@ kick and position drift are scaled by dt (Q16). Used by path prediction
+@ so each body's 256 substeps cover one period regardless of orbit size.
+@
+@   v += a * dt        (semi-implicit Euler kick, scaled)
+@   p += v * dt        (drift, scaled)
+@
+@ At dt = 0x10000 (Q16 1.0) this is bit-identical to cowell_step.
+@ ----------------------------------------------------------------------------
+cowell_step_dt:
+        push    {r4-r11, lr}
+        push    {r1}                    @ dt at sp+0 within function
+        mov     r4, r0                  @ state ptr
+        ldr     r5, [r4, #0]            @ x
+        ldr     r6, [r4, #4]            @ y
+        ldr     r7, [r4, #8]            @ vx
+        ldr     r8, [r4, #12]           @ vy
+
+        ldr     r0, =PLANET_X_Q16
+        sub     r9, r0, r5              @ dx
+        ldr     r0, =PLANET_Y_Q16
+        sub     r10, r0, r6             @ dy
+
+        @ r² = dx² + dy²
+        mov     r0, r9
+        mov     r1, r9
+        bl      fx_mul_q16
+        mov     r11, r0
+        mov     r0, r10
+        mov     r1, r10
+        bl      fx_mul_q16
+        add     r11, r11, r0            @ r11 = r²
+
+        cmp     r11, #0x10000
+        blt     _csdt_skip_grav
+
+        mov     r0, r11
+        bl      fx_sqrt_q16
+        push    {r0}                    @ stack: [r, dt, ...]
+
+        ldr     r0, =MU_Q16
+        mov     r1, r11
+        bl      fx_div_q16              @ a_mag = MU/r²
+        ldr     r1, [sp, #4]            @ dt (at sp+4 with r on top)
+        bl      fx_mul_q16              @ a_mag * dt
+        push    {r0}                    @ stack: [a*dt, r, dt, ...]
+
+        @ vx += (a*dt) * (dx / r)
+        mov     r0, r9
+        ldr     r1, [sp, #4]            @ r
+        bl      fx_div_q16
+        ldr     r1, [sp]                @ a*dt
+        bl      fx_mul_q16
+        add     r7, r7, r0
+
+        @ vy += (a*dt) * (dy / r)
+        mov     r0, r10
+        ldr     r1, [sp, #4]            @ r
+        bl      fx_div_q16
+        ldr     r1, [sp]                @ a*dt
+        bl      fx_mul_q16
+        add     r8, r8, r0
+
+        add     sp, sp, #8              @ drop [a*dt, r]; dt at sp+0 again
+
+_csdt_skip_grav:
+        @ Drift: x += vx*dt, y += vy*dt
+        ldr     r1, [sp]                @ dt
+        mov     r0, r7
+        bl      fx_mul_q16
+        add     r5, r5, r0
+        ldr     r1, [sp]                @ dt
+        mov     r0, r8
+        bl      fx_mul_q16
+        add     r6, r6, r0
+
+        str     r5, [r4, #0]
+        str     r6, [r4, #4]
+        str     r7, [r4, #8]
+        str     r8, [r4, #12]
+
+        add     sp, sp, #4              @ drop dt
+        pop     {r4-r11, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _compute_path_dt(state_ptr) -> dt_q16
+@
+@ Returns a dt (Q16 substeps/frame) sized so cowell_step_dt iterated
+@ PATH_N_POINTS (256) times covers roughly one orbital period at the
+@ body's current radius from the primary. Approximates the orbit as
+@ circular at the current radius:
+@
+@     T   = 2π · sqrt(r³ / μ)
+@         = 2π · r · sqrt(r / μ)         (avoids r³ overflow in Q16)
+@     dt  = T / 256                       (= T >> 8 in Q16)
+@
+@ A radius below 1.0 Q16 falls back to dt = 1.0.
+@ ----------------------------------------------------------------------------
+        .equ TWO_PI_Q16,   0x6487F      @ 2π × 65536 ≈ 411775
+
+_compute_path_dt:
+        push    {r4-r7, lr}
+        mov     r4, r0
+        @ dx, dy primary-centred
+        ldr     r0, [r4, #0]
+        ldr     r1, =PLANET_X_Q16
+        sub     r5, r0, r1
+        ldr     r0, [r4, #4]
+        ldr     r1, =PLANET_Y_Q16
+        sub     r6, r0, r1
+        @ r² = dx² + dy²
+        mov     r0, r5
+        mov     r1, r5
+        bl      fx_mul_q16
+        mov     r7, r0
+        mov     r0, r6
+        mov     r1, r6
+        bl      fx_mul_q16
+        add     r7, r7, r0              @ r²
+        cmp     r7, #0x10000
+        blo     _cpdt_min
+        @ r = sqrt(r²)
+        mov     r0, r7
+        bl      fx_sqrt_q16
+        mov     r5, r0                  @ r5 = r
+        @ r / μ
+        ldr     r1, =MU_Q16
+        bl      fx_div_q16
+        @ sqrt(r/μ)
+        bl      fx_sqrt_q16
+        mov     r6, r0                  @ sqrt(r/μ)
+        @ 2π · r
+        mov     r0, r5
+        ldr     r1, =TWO_PI_Q16
+        bl      fx_mul_q16
+        @ T = (2π · r) · sqrt(r/μ)
+        mov     r1, r6
+        bl      fx_mul_q16
+        @ dt = T / 256 (T >> 8)
+        mov     r0, r0, asr #8
+        pop     {r4-r7, lr}
+        bx      lr
+_cpdt_min:
+        ldr     r0, =0x10000
+        pop     {r4-r7, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
 @ elements_from_state(state_ptr, out_ptr) -- classical orbital elements.
 @
 @   state_ptr -> [ x_q16, y_q16, vx_q16, vy_q16 ]  (primary at origin)

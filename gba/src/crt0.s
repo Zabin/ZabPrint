@@ -560,36 +560,21 @@ grapple_drag:
         cmp     r0, #GRAPPLE_FULL
         blt     grapple_done
 
-        @ Tow-to-graveyard complete: respawn target from init table, +3 score,
-        @ Destroy mission advance if matched, debris will spawn via
-        @ _spawn_debris (added in 8c.11).
+        @ Tow-to-graveyard complete: +3 score, Destroy mission advance if
+        @ matched, debris spawn via _spawn_debris (added in 8c.11).
+        @ Layer 8j: don't teleport the target back to init_orbits -- that
+        @ caused the same visible position jump that the DEW respawn did.
+        @ Just restore HP + hold-timer; the path stays valid (orbit didn't
+        @ change here -- the tow only nudged velocity). If the grapple
+        @ completes a Destroy mission, _cycle_mission rerolls the new
+        @ mission target for us.
         mov     r2, r5                          @ stash idx
-        add     r1, r5, #1
-        ldr     r0, =init_orbits
-        add     r0, r0, r1, lsl #4
-        mov     r1, r12
-        add     r1, r1, r2, lsl #4
-        add     r1, r1, #S_T0
-        push    {r2, lr}
-        bl      _copy_orbit_body
-        pop     {r2, lr}
         ldr     r12, =STATE
-        @ Reset target health + hold timer.
         add     r3, r12, r2, lsl #2
         mov     r1, #DEW_INIT_HEALTH
         str     r1, [r3, #S_T_HEALTH]
         mov     r1, #0
         str     r1, [r3, #S_HOLD_TIMERS]
-        @ Mark that target's path dirty.
-        cmp     r2, #0
-        moveq   r1, #2
-        cmp     r2, #1
-        moveq   r1, #4
-        cmp     r2, #2
-        moveq   r1, #8
-        ldr     r3, [r12, #S_PATH_DIRTY]
-        orr     r3, r3, r1
-        str     r3, [r12, #S_PATH_DIRTY]
         @ Score += 3.
         ldr     r1, [r12, #S_SCORE]
         add     r1, r1, #3
@@ -1787,11 +1772,12 @@ _ddr_next:
         bx      lr
 
 @ ----------------------------------------------------------------------------
-@ _predict_path(body_ptr, out_ptr) -- forward-integrate PATH_N_POINTS
-@ substeps of cowell_step on a scratch copy of the body's state, storing
-@ (x_q16, y_q16) at each step into the out buffer (8 B per point).
+@ _predict_path(body_ptr, out_ptr, dt) -- forward-integrate PATH_N_POINTS
+@ substeps of cowell_step_dt on a scratch copy of the body's state,
+@ storing (x_q16, y_q16) at each step into the out buffer (8 B per point).
 @   r0 = body state ptr (4 Q16 words: x, y, vx, vy)
 @   r1 = output cache ptr
+@   r2 = dt (Q16 substeps/frame); pick via _compute_path_dt for the body
 @ Real body state is left untouched.
 @ Clobbers r0..r3, r12; preserves r4-r11 via push/pop.
 @ ----------------------------------------------------------------------------
@@ -1801,6 +1787,7 @@ _predict_path:
         sub     sp, sp, #16
         mov     r4, sp                          @ scratch ptr
         mov     r5, r1                          @ out ptr
+        mov     r8, r2                          @ stash dt for the inner loop
         @ Copy body state into scratch.
         ldr     r6, [r0, #0]
         str     r6, [r4, #0]
@@ -1818,9 +1805,10 @@ _pp_loop:
         ldr     r7, [r4, #4]
         str     r7, [r5, #4]
         add     r5, r5, #8
-        @ Step the scratch copy.
+        @ Step the scratch copy by dt.
         mov     r0, r4
-        bl      cowell_step
+        mov     r1, r8
+        bl      cowell_step_dt
         subs    r6, r6, #1
         bne     _pp_loop
         add     sp, sp, #16
@@ -1892,7 +1880,11 @@ _refresh_paths:
         @ Player (bit 0) -- highest priority since burns dirty only this bit.
         tst     r5, #1
         beq     _rp_t0
+        @ Compute per-body dt from current radius, then predict path.
         mov     r0, r4
+        bl      _compute_path_dt
+        mov     r2, r0                          @ dt
+        ldr     r0, =STATE
         ldr     r1, =(STATE + S_PATH_PLAYER)
         bl      _predict_path
         ldr     r4, =STATE
@@ -1903,6 +1895,10 @@ _refresh_paths:
 _rp_t0:
         tst     r5, #2
         beq     _rp_t1
+        add     r0, r4, #S_T0
+        bl      _compute_path_dt
+        mov     r2, r0
+        ldr     r4, =STATE
         add     r0, r4, #S_T0
         ldr     r1, =(STATE + S_PATH_T0)
         bl      _predict_path
@@ -1915,6 +1911,10 @@ _rp_t1:
         tst     r5, #4
         beq     _rp_t2
         add     r0, r4, #S_T1
+        bl      _compute_path_dt
+        mov     r2, r0
+        ldr     r4, =STATE
+        add     r0, r4, #S_T1
         ldr     r1, =(STATE + S_PATH_T1)
         bl      _predict_path
         ldr     r4, =STATE
@@ -1925,6 +1925,10 @@ _rp_t1:
 _rp_t2:
         tst     r5, #8
         beq     _rp_done
+        add     r0, r4, #S_T2
+        bl      _compute_path_dt
+        mov     r2, r0
+        ldr     r4, =STATE
         add     r0, r4, #S_T2
         ldr     r1, =(STATE + S_PATH_T2)
         bl      _predict_path

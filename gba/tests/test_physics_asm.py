@@ -366,6 +366,90 @@ def test_cowell_step_circular_orbit_stays_bounded(cowell_blob):
     assert 32 <= r_now <= 48, f"orbit radius drifted to {r_now} (initial 40)"
 
 
+# --- cowell_step_dt --------------------------------------------------------
+
+def _arm_cowell_dt(blob, x, y, vx, vy, dt):
+    cpu = ArmCpu()
+    cpu.load_code(blob.bytes_, at=_BASE)
+    state_addr = 0x1000
+    cpu.write_u32(state_addr,      x  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 4,  y  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 8,  vx & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 12, vy & 0xFFFFFFFF)
+    cpu.set_reg(0, state_addr)
+    cpu.set_reg(1, dt & 0xFFFFFFFF)
+    cpu.set_reg(13, 0x10000)
+    cpu.call(blob.symbols["cowell_step_dt"])
+    return (
+        _signed(cpu.read_u32(state_addr)),
+        _signed(cpu.read_u32(state_addr + 4)),
+        _signed(cpu.read_u32(state_addr + 8)),
+        _signed(cpu.read_u32(state_addr + 12)),
+    )
+
+
+def test_cowell_step_dt_bit_identical_at_dt_one(cowell_blob):
+    """Layer 8k: cowell_step_dt(state, 0x10000) must be byte-for-byte
+    identical to cowell_step(state). Tests that the scaling factor doesn't
+    introduce drift when dt = Q16(1.0)."""
+    cases = [
+        (_PLANET_X_Q16 + (40 << 16), _PLANET_Y_Q16,            0, 56756),  # circular @ r=40
+        (_PLANET_X_Q16 + (100 << 16), _PLANET_Y_Q16,           0, 1 << 14),
+        (_PLANET_X_Q16, _PLANET_Y_Q16 + (-40 << 16),       56756, 0),       # boot orbit
+    ]
+    for x, y, vx, vy in cases:
+        ref = _arm_cowell(cowell_blob, x, y, vx, vy)
+        out = _arm_cowell_dt(cowell_blob, x, y, vx, vy, 0x10000)
+        assert out == ref, \
+            f"cowell_step_dt(dt=1) mismatch for ({x:#x},{y:#x},{vx:#x},{vy:#x}):\n" \
+            f"  cowell_step    -> {ref}\n" \
+            f"  cowell_step_dt -> {out}"
+
+
+def test_cowell_step_dt_half_dt_advances_half_step(cowell_blob):
+    """At dt = 0.5 (Q16 0x8000) the position change should be ~½ that of
+    one full step (within integration error)."""
+    x0, y0 = _PLANET_X_Q16 + (100 << 16), _PLANET_Y_Q16
+    vx0, vy0 = 0, 1 << 15           # 0.5 px/frame downward
+    full = _arm_cowell_dt(cowell_blob, x0, y0, vx0, vy0, 0x10000)
+    half = _arm_cowell_dt(cowell_blob, x0, y0, vx0, vy0, 0x08000)
+    full_dy = full[1] - y0
+    half_dy = half[1] - y0
+    # half step moves about half the y distance of the full step. Allow
+    # 20% slack for the velocity-kick interaction with the drift.
+    assert abs(2 * half_dy - full_dy) < abs(full_dy) // 4, \
+        f"half-dt should advance ~half: full_dy={full_dy} half_dy={half_dy}"
+
+
+def _arm_compute_path_dt(blob, x, y):
+    cpu = ArmCpu()
+    cpu.load_code(blob.bytes_, at=_BASE)
+    state_addr = 0x1000
+    cpu.write_u32(state_addr,      x  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 4,  y  & 0xFFFFFFFF)
+    cpu.write_u32(state_addr + 8,  0)
+    cpu.write_u32(state_addr + 12, 0)
+    cpu.set_reg(0, state_addr)
+    cpu.set_reg(13, 0x10000)
+    cpu.call(blob.symbols["_compute_path_dt"])
+    return _signed(cpu.get_reg_s32(0))
+
+
+def test_compute_path_dt_matches_analytic(cowell_blob):
+    """dt should equal 2π·sqrt(r³/μ)/256 to within a few ULPs. μ = 30."""
+    import math
+    mu = 30.0
+    for r in (20, 40, 80, 120, 180):
+        x = _PLANET_X_Q16 + (r << 16)
+        y = _PLANET_Y_Q16
+        got_q16 = _arm_compute_path_dt(cowell_blob, x, y)
+        got = got_q16 / 65536.0
+        want = 2 * math.pi * math.sqrt(r ** 3 / mu) / 256
+        rel = abs(got - want) / want
+        assert rel < 0.01, \
+            f"r={r}: got dt={got:.4f}, want {want:.4f} (rel err {rel:.4%})"
+
+
 # --- elements_from_state ------------------------------------------------
 #
 # Classical orbital elements from a 2D state vector. Primary at the ORIGIN

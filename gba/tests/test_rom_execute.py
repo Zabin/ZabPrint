@@ -161,6 +161,34 @@ def test_rom_path_first_point_matches_state(rom_bytes):
     assert 30 <= py <= 50, f"path[0].y = {py} should be near 40"
 
 
+def test_rom_path_closes_on_circular_orbit(rom_bytes):
+    """Layer 8k: with per-body period-aware dt, the 256-point path covers
+    one full period, so path[0] and path[255] should be very close together
+    for a circular orbit. Pre-fix (dt=1) only ~88% of an r=40 orbit was
+    sampled, so path[255] sat well away from path[0]."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    # Park player at (160, 80) on a clean circular orbit (r=40, CW).
+    cpu.write_u32(IWRAM_BASE + 0x00, 160 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x04,  80 << 16)
+    cpu.write_u32(IWRAM_BASE + 0x08, 0)
+    cpu.write_u32(IWRAM_BASE + 0x0C, 56756)
+    # Re-dirty the player path so _refresh_paths recomputes from new state.
+    cpu.write_u32(IWRAM_BASE + 0x154, 0xF)
+    cpu.run_for(2_000_000)              # several frames -> all 4 paths refresh
+    p0_x = _s32(cpu.read_u32(IWRAM_BASE + 0x160)) >> 16
+    p0_y = _s32(cpu.read_u32(IWRAM_BASE + 0x164)) >> 16
+    # path[255] is at the LAST 8-byte slot: 0x160 + 255 * 8 = 0x958
+    p_last_x = _s32(cpu.read_u32(IWRAM_BASE + 0x958)) >> 16
+    p_last_y = _s32(cpu.read_u32(IWRAM_BASE + 0x95C)) >> 16
+    # On a closed orbit, path[0] and path[255] sit at the start/end of
+    # one full revolution -- within a few pixels of each other.
+    dist_sq = (p_last_x - p0_x) ** 2 + (p_last_y - p0_y) ** 2
+    assert dist_sq <= 25, \
+        f"path[0]=({p0_x},{p0_y}) and path[255]=({p_last_x},{p_last_y}) " \
+        f"expected to close on a circular orbit; d²={dist_sq}"
+
+
 def _reset_player_to_phase_zero(cpu):
     """Place player at position-phase 0 (planet-relative +x axis at radius
     40) with tangential CW circular velocity, so the next frame's phase
