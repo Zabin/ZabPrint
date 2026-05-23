@@ -84,6 +84,8 @@
         .equ S_PATH_T0,           0x960
         .equ S_PATH_T1,           0x1160
         .equ S_PATH_T2,           0x1960
+        .equ S_BEAT_COUNTER,      0x2160 @ frames until next beat fires (8n: post-path-cache, manually inited)
+        .equ S_BEAT_PARITY,       0x2164 @ 0..7 index into note_freqs (advances on each beat)
         .equ PATH_N_POINTS,       256
         .equ PATH_BYTES,          2048 @ 256 * 8 -- enough substeps to close
                                        @ a full orbit at default radius (T ~ 240 frames).
@@ -98,6 +100,22 @@
         .equ DEW_INIT_HEALTH,     3
         .equ DV_REFILL_Q16,       0x00190000   @ 25 (Q16) refill on mission complete
         .equ RIC_ZOOM_SHIFT, 14         @ Q16 ΔR/ΔI -> screen px:  >> (16-2) = ×4 zoom
+
+        @ -------- Music (Layer 8n) --------
+        @ Beat scheduler: chase target's |v|² in Q16 drives the inter-beat
+        @ frame count via beat = K / v². Smaller orbit / higher v → faster
+        @ beat. On an eccentric orbit |v| varies (high at periapsis, low at
+        @ apoapsis) so the beat naturally speeds up and slows down.
+        .equ MIN_BEAT_FRAMES, 18              @ ≈200 BPM ceiling
+        .equ MAX_BEAT_FRAMES, 180             @ ≈20 BPM floor
+        .equ REG_SOUND1CNT_L, 0x04000060
+        .equ REG_SOUND1CNT_H, 0x04000062
+        .equ REG_SOUND1CNT_X, 0x04000064
+        .equ REG_SOUND2CNT_L, 0x04000068
+        .equ REG_SOUND2CNT_H, 0x0400006C
+        .equ REG_SOUNDCNT_L,  0x04000080
+        .equ REG_SOUNDCNT_H,  0x04000082
+        .equ REG_SOUNDCNT_X,  0x04000084
 
         @ Tuning: planet at screen centre, MU sized for ~4-second orbits at
         @ radius 40 pixels. These match the defaults in physics.s.
@@ -175,6 +193,29 @@ init_z:
         @ of a 16k-brad spurious step from prev=0. init_z already cleared
         @ S_CUM_PHASE so no zero-store needed here.
         bl      _seed_player_phase
+
+        @ Music (Layer 8n): master sound enable, route PSG ch1+ch2 to
+        @ both stereo sides at full volume, clear ch1 sweep. Seed the
+        @ beat scheduler with an arbitrary positive interval -- the
+        @ first beat overwrites it with the chase-derived value.
+        ldr     r0, =REG_SOUNDCNT_X
+        mov     r1, #0x80
+        strh    r1, [r0]
+        ldr     r0, =REG_SOUNDCNT_L
+        ldr     r1, =0x3377
+        strh    r1, [r0]
+        ldr     r0, =REG_SOUNDCNT_H
+        mov     r1, #0x02
+        strh    r1, [r0]
+        ldr     r0, =REG_SOUND1CNT_L
+        mov     r1, #0
+        strh    r1, [r0]
+        ldr     r0, =(STATE + S_BEAT_COUNTER)
+        mov     r1, #30
+        str     r1, [r0]
+        ldr     r0, =(STATE + S_BEAT_PARITY)
+        mov     r1, #0
+        str     r1, [r0]
 
 frame_loop:
         @ -------- vsync -----------------------------------------------
@@ -800,6 +841,24 @@ hold_advance:
         bl      fx_atan2
         ldr     r12, =STATE
         str     r0, [r12, #S_SENSOR_DIR]
+
+        @ -------- music beat scheduler (Layer 8n) ---------------------
+        @ Decrement S_BEAT_COUNTER each frame; on <=0 fire kick (PSG1)
+        @ + a melodic note (PSG2) and reload the counter from the chase
+        @ target's velocity magnitude. Beat tempo therefore tracks the
+        @ orbital speed of the active mission target: small orbits beat
+        @ fast, big orbits beat slow, eccentric orbits accelerate near
+        @ periapsis and decelerate near apoapsis.
+        ldr     r12, =(STATE + S_BEAT_COUNTER)
+        ldr     r0, [r12]
+        subs    r0, r0, #1
+        str     r0, [r12]
+        bgt     _beat_done
+        bl      _fire_beat_sounds
+        bl      _compute_beat_frames
+        ldr     r12, =(STATE + S_BEAT_COUNTER)
+        str     r0, [r12]
+_beat_done:
 
         @ -------- clear VRAM ------------------------------------------
         @ Use stmia with 8 registers per iter (16 pixels per iter) so the
@@ -1487,6 +1546,113 @@ _seed_player_phase:
         str     r0, [r4, #S_PREV_PHASE]
         pop     {r4, lr}
         bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _fire_beat_sounds -- emit one beat: kick on SOUND1 + melodic note on
+@ SOUND2 (note picked from note_freqs by S_BEAT_PARITY, then parity
+@ advances mod 8). The kick is a fixed low-frequency square burst; the
+@ note cycles through a minor pentatonic A-C-D-E-G ascend/descend so the
+@ scheduler's variable tempo carries an audible melody.
+@ Clobbers r0-r3, r12. Preserves r4-r11 via push.
+@ ----------------------------------------------------------------------------
+_fire_beat_sounds:
+        push    {r4-r5, lr}
+        ldr     r0, =(STATE + S_BEAT_PARITY)
+        ldr     r5, [r0]                        @ r5 = current parity 0..7
+        @ Note frequency from table.
+        ldr     r1, =note_freqs
+        add     r1, r1, r5, lsl #2
+        ldr     r2, [r1]                        @ r2 = freq value (low 11 bits)
+        @ --- Kick: SOUND1 with low freq + sharp decay envelope ---
+        ldr     r0, =REG_SOUND1CNT_H
+        ldr     r1, =0xF480                     @ env_init=15 dir=0 step=4, duty=50%
+        strh    r1, [r0]
+        ldr     r0, =REG_SOUND1CNT_X
+        ldr     r1, =0x8000                     @ restart, freq=0 -> ~64 Hz
+        strh    r1, [r0]
+        @ --- Melody note: SOUND2 with a slightly softer envelope ---
+        ldr     r0, =REG_SOUND2CNT_L
+        ldr     r1, =0xC480                     @ env_init=12 dir=0 step=4, duty=50%
+        strh    r1, [r0]
+        ldr     r0, =REG_SOUND2CNT_H
+        orr     r2, r2, #0x8000                 @ set restart bit
+        strh    r2, [r0]
+        @ Advance parity.
+        add     r5, r5, #1
+        and     r5, r5, #7
+        ldr     r0, =(STATE + S_BEAT_PARITY)
+        str     r5, [r0]
+        pop     {r4-r5, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ _compute_beat_frames -> integer frames to next beat
+@
+@ Reads the chase (mission target) satellite's vx/vy from STATE, forms
+@ |v|² (Q16), then beat_frames = K_Q16 / v²_Q16 (Q16 -> integer via
+@ asr #16). Clamped to [MIN_BEAT_FRAMES, MAX_BEAT_FRAMES]. Returns the
+@ integer count in r0.
+@
+@ Tempo mapping at K = 32 (Q16 0x200000):
+@   v² = 1.5   (r≈20 circular):  beat ≈ 21 frames  -> 171 BPM
+@   v² = 0.75  (r=40 circular):  beat ≈ 43         -> 84 BPM
+@   v² = 0.19  (r=160 circular): beat clamped 180  -> 20 BPM
+@
+@ Clobbers r0-r3, r12.
+@ ----------------------------------------------------------------------------
+        .equ BEAT_K_Q16, 0x200000               @ 32 (Q16); tempo scale
+
+_compute_beat_frames:
+        push    {r4-r5, lr}
+        ldr     r4, =STATE
+        ldr     r5, [r4, #S_MISSION_TARGET]
+        mov     r5, r5, lsl #4
+        add     r5, r5, #S_T0
+        add     r5, r4, r5                      @ r5 = &chase (preserved across bl)
+        ldr     r0, [r5, #8]                    @ vx
+        mov     r1, r0
+        bl      fx_mul_q16                      @ r0 = vx² (Q16)
+        mov     r4, r0
+        ldr     r0, [r5, #12]                   @ vy
+        mov     r1, r0
+        bl      fx_mul_q16                      @ r0 = vy² (Q16)
+        add     r4, r4, r0                      @ r4 = v² (Q16)
+        cmp     r4, #0x100
+        ble     _cbf_max
+        ldr     r0, =BEAT_K_Q16
+        mov     r1, r4
+        bl      fx_div_q16                      @ r0 = beat (Q16)
+        mov     r0, r0, asr #16                 @ integer frames
+        cmp     r0, #MIN_BEAT_FRAMES
+        movlt   r0, #MIN_BEAT_FRAMES
+        cmp     r0, #MAX_BEAT_FRAMES
+        movgt   r0, #MAX_BEAT_FRAMES
+        pop     {r4-r5, lr}
+        bx      lr
+_cbf_max:
+        mov     r0, #MAX_BEAT_FRAMES
+        pop     {r4-r5, lr}
+        bx      lr
+
+@ ----------------------------------------------------------------------------
+@ A minor pentatonic ascend / descend (A4 C5 D5 E5 G5 E5 D5 C5).
+@ GBA freq encoding: f_Hz = 131072 / (2048 - n).  n stored here.
+@   A4 = 440 Hz  ->  n = 2048 - 298 = 1750
+@   C5 = 523 Hz  ->  n = 2048 - 250 = 1798
+@   D5 = 587 Hz  ->  n = 2048 - 223 = 1825
+@   E5 = 659 Hz  ->  n = 2048 - 199 = 1849
+@   G5 = 784 Hz  ->  n = 2048 - 167 = 1881
+@ ----------------------------------------------------------------------------
+        .align 4
+note_freqs:
+        .word 1750
+        .word 1798
+        .word 1825
+        .word 1849
+        .word 1881
+        .word 1849
+        .word 1825
+        .word 1798
 
 @ ----------------------------------------------------------------------------
 @ _check_orbit_limit -- called after every orbit increment. If the current

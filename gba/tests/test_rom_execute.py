@@ -811,6 +811,109 @@ def test_rom_grapple_releases_when_target_out_of_range(rom_bytes):
         f"grapple should release when target is out of range; got idx={g}"
 
 
+def test_rom_music_sound_master_enabled_at_boot(rom_bytes):
+    """Layer 8n: _start must master-enable PSG sound (REG_SOUNDCNT_X bit 7)
+    so subsequent SOUND1/SOUND2 triggers actually emit on the speakers."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    soundcnt_x = cpu.read_u16(IO_BASE + 0x84)
+    assert (soundcnt_x & 0x80) != 0, \
+        f"REG_SOUNDCNT_X bit 7 (master enable) should be set; got 0x{soundcnt_x:04X}"
+    # PSG channels 1+2 routed to both stereo sides.
+    soundcnt_l = cpu.read_u16(IO_BASE + 0x80)
+    assert soundcnt_l == 0x3377, \
+        f"REG_SOUNDCNT_L expected 0x3377 (ch1+ch2 L+R, vol 7); got 0x{soundcnt_l:04X}"
+
+
+def test_rom_music_beat_counter_initialised(rom_bytes):
+    """Layer 8n: S_BEAT_COUNTER must be initialised to a positive value
+    at boot (we seed 30 frames so the first beat fires within ~0.5 s)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(50_000)                              # past init copy, before first frame
+    bc = _s32(cpu.read_u32(IWRAM_BASE + 0x2160))
+    assert 1 <= bc <= 60, f"S_BEAT_COUNTER expected 1..60 at boot; got {bc}"
+
+
+def test_rom_music_beat_counter_decrements_each_frame(rom_bytes):
+    """The beat scheduler subtracts 1 from S_BEAT_COUNTER on every frame
+    regardless of warp. After several frames the counter must have
+    changed (decreased monotonically, or wrapped via a fresh reload).
+    Boot frames are expensive (path refresh) so use a wide window."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(5_000_000)                           # past boot path-refresh
+    fc0 = cpu.read_u32(IWRAM_BASE + 0x18)
+    bc0 = _s32(cpu.read_u32(IWRAM_BASE + 0x2160))
+    cpu.run_for(3_000_000)                           # several steady-state frames
+    fc1 = cpu.read_u32(IWRAM_BASE + 0x18)
+    bc1 = _s32(cpu.read_u32(IWRAM_BASE + 0x2160))
+    df = fc1 - fc0
+    assert df >= 2, f"need >=2 frames advance to test decrement; got {df}"
+    assert bc1 != bc0, \
+        f"S_BEAT_COUNTER unchanged after {df} frames: bc0={bc0} bc1={bc1}"
+    assert 1 <= bc1 <= 200, f"S_BEAT_COUNTER after {df} frames: 0x{bc1:08X}"
+
+
+def test_rom_music_beat_fires_and_triggers_sound1(rom_bytes):
+    """Run long enough for the seeded 30-frame counter to expire. After
+    the first beat fires, REG_SOUND1CNT_X bit 15 (restart) must be set."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(16_000_000)
+    s1x = cpu.read_u16(IO_BASE + 0x64)
+    assert (s1x & 0x8000) != 0, \
+        f"SOUND1CNT_X bit 15 (kick restart) should be set after a beat; got 0x{s1x:04X}"
+
+
+def test_rom_music_beat_fires_sound2_with_melody_note(rom_bytes):
+    """Same beat fire writes a melody-note restart to SOUND2 (chan 2) at
+    one of the 5 pentatonic frequencies (1750, 1798, 1825, 1849, 1881)."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(16_000_000)
+    s2h = cpu.read_u16(IO_BASE + 0x6C)
+    restart = (s2h & 0x8000) != 0
+    freq = s2h & 0x7FF
+    valid_freqs = {1750, 1798, 1825, 1849, 1881}
+    assert restart, f"SOUND2CNT_H restart bit must be set; got 0x{s2h:04X}"
+    assert freq in valid_freqs, \
+        f"SOUND2 freq should be a pentatonic note ({valid_freqs}); got {freq}"
+
+
+def test_rom_music_beat_parity_advances(rom_bytes):
+    """S_BEAT_PARITY cycles 0..7. After enough frames for at least one
+    beat to fire, parity must have advanced past 0."""
+    cpu = _make_cpu(rom_bytes)
+    cpu.run_for(400_000)
+    assert cpu.read_u32(IWRAM_BASE + 0x2164) == 0, "parity should boot at 0"
+    cpu.run_for(16_000_000)
+    parity = cpu.read_u32(IWRAM_BASE + 0x2164)
+    assert 1 <= parity <= 7, f"beat parity should advance after a beat; got {parity}"
+
+
+def test_rom_music_beat_period_scales_with_chase_velocity(rom_bytes):
+    """Post-fire reloaded S_BEAT_COUNTER = K/|v|², so a faster chase
+    target yields a shorter interval. Compare two scenarios: chase
+    pinned at high velocity vs low velocity. The high-velocity reload
+    must be strictly smaller."""
+    rom = rom_bytes
+
+    def reload_for_vy(vy_q16):
+        cpu = _make_cpu(rom)
+        cpu.run_for(2_000_000)                          # past boot path-refresh
+        # mission_target = 0 (default); T0 is the chase. Pin its velocity.
+        cpu.write_u32(IWRAM_BASE + 0x28, 0)
+        cpu.write_u32(IWRAM_BASE + 0x2C, vy_q16 & 0xFFFFFFFF)
+        cpu.write_u32(IWRAM_BASE + 0x2160, 1)           # force beat next frame
+        cpu.run_for(2_000_000)                          # let beat fire + reload
+        return _s32(cpu.read_u32(IWRAM_BASE + 0x2160))
+
+    fast = reload_for_vy(80250)   # v_circ_20
+    slow = reload_for_vy(28377)   # v_circ_160
+    assert fast < slow, \
+        f"fast-orbit beat interval should be shorter than slow-orbit; " \
+        f"fast={fast}, slow={slow}"
+    assert 18 <= fast <= 180, f"fast reload out of clamp: {fast}"
+    assert 18 <= slow <= 180, f"slow reload out of clamp: {slow}"
+
+
 def test_rom_grapple_does_not_perturb_distant_target_velocity(rom_bytes):
     """Companion to the release test: even though grapple_target was
     pre-set, the distant target's velocity must NOT have been pulled toward

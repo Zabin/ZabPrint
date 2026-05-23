@@ -1,7 +1,12 @@
 # memory.md — cross-session state for the GBA space game
 
-Last updated after Layer 8m (LAP cumulative Δφ + path uses semi-major
-axis + grapple range re-check) playtest fixes.
+Last updated after Layer 8n (chase-driven music beat) — first audible
+ROM. Music is a 2-channel PSG beat: SOUND1 kick on every fire,
+SOUND2 melodic note cycling through an A-minor pentatonic. Inter-beat
+frame count is `K / |v_chase|²` (K = 32 Q16) so the tempo tracks the
+mission target's velocity: small orbits beat fast (~170 BPM), big
+orbits beat slow (clamped to ~20 BPM), eccentric orbits accelerate
+near periapsis and decelerate near apoapsis.
 
 ## Current state of the world
 
@@ -64,6 +69,7 @@ axis + grapple range re-check) playtest fixes.
 | 8j — DEW respawn-in-place + RIC tracks mission target + per-mission reroll | done | `eb79b32` |
 | 8k — Per-body period-aware path coverage + grapple-tow teleport fix | done | `877dc00` |
 | 8m — LAP cumulative Δφ + path uses semi-major axis + grapple range re-check | done | `d6fbec8` |
+| 8n — Music beat scheduler tied to chase satellite velocity (PSG ch1+ch2) | done | pending |
 | 9a — Minimal ROM (boots, splash) | done | `508ecad` |
 | 9b — D-pad ship + starfield + planets | done | `4b0bad5` |
 | 9c — Drift physics + projectile | done (replaced) | `22ab75d` |
@@ -140,7 +146,9 @@ The interpreter (`toolchain/armsim.py`) covers every instruction
 0x960  path_target0                                       2048 B
 0x1160 path_target1                                       2048 B
 0x1960 path_target2                                       2048 B
-0x2160 end                                                ~8.5 KB total
+0x2160 beat_counter                                         4 B   (8n: frames until next beat fires)
+0x2164 beat_parity                                          4 B   (8n: 0..7 -> note_freqs[] index)
+0x2168 end                                                ~8.5 KB total
 ```
 
 `init_z` zero-fills 100 words (`mov r2, #100`, covers 0..0x190) on boot
@@ -230,7 +238,8 @@ the hand-encoded entry branch and runs through `pack_rom()`.
 | 8i (phase-based LAP) | 361 | +1 (real-orbit circular wrap) |
 | 8j (DEW respawn + RIC + reroll) | 364 | +3 (respawn-in-place, reroll, RIC mission target) |
 | 8k (period-aware paths + grapple fix) | 368 | +4 (cowell_step_dt × 2, _compute_path_dt, path closes) |
-| 8m (LAP cum-Δ, path uses a not r, grapple range re-check) | **374** | +7 -1 (lap algo / eccentric path / grapple release) |
+| 8m (LAP cum-Δ, path uses a not r, grapple range re-check) | 374 | +7 -1 (lap algo / eccentric path / grapple release) |
+| 8n (chase-velocity music beat) | **381** | +7 (sound enable, beat fire, scaling) |
 
 ## Assembler quirks to remember (also in CLAUDE.md)
 
